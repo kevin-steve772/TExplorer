@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(TExplorer src/main.cpp src/platform.cpp)
+add_executable(TExplorer src/main.cpp src/platform.cpp src/i18n.cpp)
 
 if(WIN32)
 

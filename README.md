@@ -1,8 +1,9 @@
 # TExplorer
 
-TExplorer 是一个使用 C++17 编写的终端文件管理器，同时支持 Linux 和 Windows。界面与操作方式参考 Windows 资源管理器，支持键盘、鼠标、标签页、地址栏导航和中文界面。
+TExplorer 是一个使用 C++17 编写的终端文件管理器，同时支持 Linux、macOS 和 Windows。界面与操作方式参考 Windows 资源管理器，支持键盘、鼠标、标签页、地址栏导航，
+以及英文、简体中文、繁体中文和梗体中文界面。
 
-Linux 下基于 ncursesw，Windows 下基于 PDCursesMod（宽字符 + UTF-8）。
+Linux 下基于 ncursesw，macOS 下使用系统 curses，Windows 下基于 PDCursesMod（宽字符 + UTF-8）。
 
 ## 功能特性
 
@@ -19,6 +20,7 @@ Linux 下基于 ncursesw，Windows 下基于 PDCursesMod（宽字符 + UTF-8）�
 - Fluent 风格滚动条：仅显示单列滑块，悬停或拖动时加粗，拖动滑块即可滚动
 - 点击标签切换、点击地址栏按钮和面包屑跳转、右上角 `×` 退出
 - 状态栏显示项目数、选中数和磁盘可用空间
+- 多语言界面：英文、简体中文、繁体中文、梗体中文（含 Linux 梗），可在动作菜单或启动参数中切换
 - 窄终端自适应布局
 
 ## 界面布局
@@ -152,6 +154,21 @@ Windows：
 ./build/TExplorer --help
 ```
 
+### 界面语言
+
+支持英文、简体中文、繁体中文和梗体中文。启动时可用 `--lang` 指定：
+
+```bash
+./build/TExplorer --lang en [目录]
+./build/TExplorer --lang zh [目录]
+./build/TExplorer --lang zh_TW [目录]
+./build/TExplorer --lang meme [目录]
+```
+
+也可以设置环境变量 `TEXPLORER_LANG`；未设置时按 `LC_ALL`、`LC_MESSAGES`、`LANG`
+自动检测，无法识别时使用简体中文。运行中可在动作菜单（`a` 或右键）选择“语言”，
+切换后立即生效，无需重启。`--help` 输出也会跟随当前语言。
+
 Linux 下建议使用 UTF-8 locale，例如 `zh_CN.UTF-8` 或 `C.UTF-8`。在 tmux 中使用鼠标时，需要开启 tmux 的鼠标支持：
 
 ```tmux
@@ -236,12 +253,16 @@ Windows 下程序会自动将控制台切换为 UTF-8 代码页，建议使用 W
 
 ```text
 .
-├── CMakeLists.txt   # CMake 构建配置（Linux: ncursesw，Windows: PDCursesMod）
+├── CMakeLists.txt        # CMake 构建配置（Linux: ncursesw，Windows: PDCursesMod）
 ├── README.md
+├── AGENTS.md
+├── install.sh / uninstall.sh
+├── install.ps1 / uninstall.ps1
 └── src
-    ├── main.cpp     # 界面、事件、文件操作
-    └── platform.h   # 平台抽象接口
-    └── platform.cpp # Windows / Linux 平台实现
+    ├── main.cpp          # 界面、事件、文件操作
+    ├── platform.h        # 平台抽象接口
+    ├── platform.cpp      # Linux / macOS / Windows 平台实现
+    └── i18n.h / i18n.cpp # 多语言文本表与语言检测
 ```
 
 ## 说明
@@ -258,4 +279,4 @@ Windows 下程序会自动将控制台切换为 UTF-8 代码页，建议使用 W
 - Windows 左侧导航窗格会列出所有可用磁盘分区；根目录/面包屑显示为 `C:\` 形式。
 - 复制 / 剪切 / 粘贴为应用内剪贴板，不调用系统剪贴板。
 - 标签页共享隐藏文件显示、导航窗格等全局视图设置。
-- 项目当前没有配置文件，启动参数仅支持起始目录。
+- 项目当前没有配置文件，启动参数支持起始目录、`--lang` 和 `--help`。

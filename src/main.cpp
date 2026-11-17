@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "i18n.h"
 #include "platform.h"
 
 namespace fs = std::filesystem;
@@ -249,39 +250,46 @@ static std::string formatTime(std::time_t t) {
 
 static std::string typeFor(const fs::path& p, bool isDir, bool isLink) {
     if (isLink)
-        return isDir ? "文件夹快捷方式" : "快捷方式";
+        return i18n::tr(isDir ? i18n::Key::FolderShortcut : i18n::Key::Shortcut);
     if (isDir)
-        return "文件夹";
+        return i18n::tr(i18n::Key::Folder);
     std::string ext = plat::pathToUtf8(p.extension());
     if (!ext.empty() && ext[0] == '.')
         ext.erase(ext.begin());
     ext = asciiLower(ext);
-    static const std::unordered_map<std::string, std::string> types = {
-        {"txt", "文本文档"},       {"md", "Markdown 文档"},  {"pdf", "PDF 文档"},
-        {"doc", "Word 文档"},      {"docx", "Word 文档"},    {"xls", "Excel 工作表"},
-        {"xlsx", "Excel 工作表"},  {"ppt", "PowerPoint 演示文稿"},
-        {"pptx", "PowerPoint 演示文稿"},                     {"png", "图像"},
-        {"jpg", "图像"},           {"jpeg", "图像"},         {"gif", "图像"},
-        {"bmp", "图像"},           {"webp", "图像"},         {"svg", "图像"},
-        {"mp4", "视频"},           {"mkv", "视频"},          {"avi", "视频"},
-        {"mov", "视频"},           {"mp3", "音频"},          {"flac", "音频"},
-        {"wav", "音频"},           {"ogg", "音频"},          {"zip", "压缩文件"},
-        {"7z", "压缩文件"},        {"rar", "压缩文件"},      {"tar", "压缩文件"},
-        {"gz", "压缩文件"},        {"xz", "压缩文件"},       {"c", "C 源文件"},
-        {"h", "C 头文件"},         {"cpp", "C++ 源文件"},    {"cc", "C++ 源文件"},
-        {"cxx", "C++ 源文件"},     {"hpp", "C++ 头文件"},    {"py", "Python 源文件"},
-        {"js", "JavaScript 文件"}, {"ts", "TypeScript 文件"},{"sh", "Shell 脚本"},
-        {"json", "JSON 文件"},     {"html", "HTML 文档"},    {"htm", "HTML 文档"},
-        {"css", "样式表"},         {"exe", "应用程序"},      {"iso", "光盘映像"},
+    static const std::unordered_map<std::string, i18n::Key> types = {
+        {"txt", i18n::Key::TypeText},       {"md", i18n::Key::TypeMarkdown},
+        {"pdf", i18n::Key::TypePDF},        {"doc", i18n::Key::TypeWord},
+        {"docx", i18n::Key::TypeWord},      {"xls", i18n::Key::TypeExcel},
+        {"xlsx", i18n::Key::TypeExcel},     {"ppt", i18n::Key::TypePowerPoint},
+        {"pptx", i18n::Key::TypePowerPoint}, {"png", i18n::Key::TypeImage},
+        {"jpg", i18n::Key::TypeImage},      {"jpeg", i18n::Key::TypeImage},
+        {"gif", i18n::Key::TypeImage},      {"bmp", i18n::Key::TypeImage},
+        {"webp", i18n::Key::TypeImage},     {"svg", i18n::Key::TypeImage},
+        {"mp4", i18n::Key::TypeVideo},      {"mkv", i18n::Key::TypeVideo},
+        {"avi", i18n::Key::TypeVideo},      {"mov", i18n::Key::TypeVideo},
+        {"mp3", i18n::Key::TypeAudio},      {"flac", i18n::Key::TypeAudio},
+        {"wav", i18n::Key::TypeAudio},      {"ogg", i18n::Key::TypeAudio},
+        {"zip", i18n::Key::TypeArchive},    {"7z", i18n::Key::TypeArchive},
+        {"rar", i18n::Key::TypeArchive},    {"tar", i18n::Key::TypeArchive},
+        {"gz", i18n::Key::TypeArchive},     {"xz", i18n::Key::TypeArchive},
+        {"c", i18n::Key::TypeCSource},      {"h", i18n::Key::TypeCHeader},
+        {"cpp", i18n::Key::TypeCppSource},  {"cc", i18n::Key::TypeCppSource},
+        {"cxx", i18n::Key::TypeCppSource},  {"hpp", i18n::Key::TypeCppHeader},
+        {"py", i18n::Key::TypePython},      {"js", i18n::Key::TypeJavaScript},
+        {"ts", i18n::Key::TypeTypeScript},  {"sh", i18n::Key::TypeShell},
+        {"json", i18n::Key::TypeJSON},      {"html", i18n::Key::TypeHTML},
+        {"htm", i18n::Key::TypeHTML},       {"css", i18n::Key::TypeStylesheet},
+        {"exe", i18n::Key::TypeApplication},{"iso", i18n::Key::TypeDiskImage},
     };
     auto it = types.find(ext);
     if (it != types.end())
-        return it->second;
+        return i18n::tr(it->second);
     if (ext.empty())
-        return "文件";
+        return i18n::tr(i18n::Key::File);
     for (char& c : ext)
         c = (char)toupper((unsigned char)c);
-    return ext + " 文件";
+    return i18n::tf(i18n::Key::TypeGeneric, ext.c_str());
 }
 
 static std::vector<std::string> wrapText(const std::string& s, int width) {
@@ -530,6 +538,7 @@ private:
         CMD_SORT_DATE,
         CMD_SORT_TYPE,
         CMD_SORT_SIZE,
+        CMD_LANGUAGE,
         CMD_HELP,
         CMD_QUIT
     };
@@ -649,6 +658,7 @@ private:
     std::vector<int> sidebarIndex;
 
     void initState(const fs::path& start);
+    void rebuildQuickItems();
     TabState snapshotTab() const;
     void saveActiveTab();
     void loadTab(int idx);
@@ -703,6 +713,7 @@ private:
     void renameCurrent();
     void showProperties();
     void showHelp();
+    void chooseLanguage();
 
     std::vector<fs::path> selectionPaths() const;
     std::string uniqueName(const fs::path& dir, const std::string& base) const;
@@ -822,14 +833,17 @@ void App::initState(const fs::path& start) {
     tec.clear();
     fs::create_directories(trashInfo, tec);
 
+    rebuildQuickItems();
+    refresh();
+}
+
+void App::rebuildQuickItems() {
     quickItems.clear();
     for (const auto& loc : plat::userLocations())
         quickItems.push_back({loc.icon, loc.label, normPath(loc.path)});
     for (const auto& loc : plat::rootLocations())
         quickItems.push_back({loc.icon, loc.label, normPath(loc.path)});
-    quickItems.push_back({ICON_TRASH, "回收站", normPath(trashFiles)});
-
-    refresh();
+    quickItems.push_back({ICON_TRASH, i18n::tr(i18n::Key::Trash), normPath(trashFiles)});
 }
 
 void App::computeLayout() {
@@ -935,7 +949,7 @@ void App::draw() {
     erase();
 
     if (COLS < 40 || LINES < 10) {
-        std::string m = "终端窗口太小，请调整大小";
+        std::string m = i18n::tr(i18n::Key::TerminalTooSmall);
         wput(stdscr, LINES / 2, 0, COLS, centerCols(m, COLS), A_BOLD);
         wrefresh(stdscr);
         return;
@@ -1006,7 +1020,7 @@ void App::newTab() {
     t.sortAsc = sortAsc;
     tabs.push_back(t);
     loadTab((int)tabs.size() - 1);
-    setStatus("新建标签页");
+    setStatus(i18n::tr(i18n::Key::NewTabStatus));
 }
 
 void App::closeTab(int idx) {
@@ -1025,7 +1039,7 @@ void App::closeTab(int idx) {
         activeTab = std::min(idx, (int)tabs.size() - 1);
     if (wasActive || activeTab >= (int)tabs.size())
         loadTab(activeTab);
-    setStatus("已关闭标签页");
+    setStatus(i18n::tr(i18n::Key::CloseTabStatus));
 }
 
 void App::drawTabs() {
@@ -1132,7 +1146,7 @@ void App::drawAddress() {
     if (inTrash()) {
         crumbRects.clear();
         crumbPaths.clear();
-        std::string lab = std::string(ICON_TRASH) + " 回收站";
+        std::string lab = std::string(ICON_TRASH) + " " + i18n::tr(i18n::Key::Trash);
         int lw = utf8Cols(lab);
         if (startX + lw <= COLS - 1) {
             Rect r{addrY, startX, 1, lw};
@@ -1230,7 +1244,7 @@ void App::drawSidebar() {
         return;
 
     int y = contentTop;
-    wput(stdscr, y, 0, sidebarW, "快速访问", A_BOLD);
+    wput(stdscr, y, 0, sidebarW, i18n::tr(i18n::Key::QuickAccess), A_BOLD);
     y++;
 
     for (size_t i = 0; i < quickItems.size(); ++i) {
@@ -1270,26 +1284,29 @@ void App::drawList() {
     if (colNameW > 0) {
         if (hovName)
             wput(stdscr, headerY, colNameX, colNameW, "", attrHover);
-        wput(stdscr, headerY, colNameX, colNameW, "名称" + mark(SortKey::Name),
+        wput(stdscr, headerY, colNameX, colNameW,
+             i18n::tr(i18n::Key::ColName) + mark(SortKey::Name),
              hovName ? (attrHover | A_BOLD) : (attrChrome | A_BOLD));
     }
     if (colDateW > 0) {
         if (hovDate)
             wput(stdscr, headerY, colDateX, colDateW, "", attrHover);
-        wput(stdscr, headerY, colDateX, colDateW, "修改日期" + mark(SortKey::Date),
+        wput(stdscr, headerY, colDateX, colDateW,
+             i18n::tr(i18n::Key::ColDate) + mark(SortKey::Date),
              hovDate ? (attrHover | A_BOLD) : (attrChrome | A_BOLD));
     }
     if (colTypeW > 0) {
         if (hovType)
             wput(stdscr, headerY, colTypeX, colTypeW, "", attrHover);
-        wput(stdscr, headerY, colTypeX, colTypeW, "类型" + mark(SortKey::Type),
+        wput(stdscr, headerY, colTypeX, colTypeW,
+             i18n::tr(i18n::Key::ColType) + mark(SortKey::Type),
              hovType ? (attrHover | A_BOLD) : (attrChrome | A_BOLD));
     }
     if (colSizeW > 0) {
         if (hovSize)
             wput(stdscr, headerY, colSizeX, colSizeW, "", attrHover);
         wput(stdscr, headerY, colSizeX, colSizeW,
-             fitRight("大小" + mark(SortKey::Size), colSizeW - 1),
+             fitRight(i18n::tr(i18n::Key::ColSize) + mark(SortKey::Size), colSizeW - 1),
              hovSize ? (attrHover | A_BOLD) : (attrChrome | A_BOLD));
     }
 
@@ -1297,7 +1314,7 @@ void App::drawList() {
         return;
 
     if (entries.empty()) {
-        std::string msg = "此文件夹为空";
+        std::string msg = i18n::tr(i18n::Key::EmptyFolder);
         wput(stdscr, rowsTop, listX, listW, centerCols(msg, listW), A_DIM);
         return;
     }
@@ -1406,7 +1423,8 @@ void App::drawStatus() {
     if (!statusMessage.empty()) {
         left = sanitize(statusMessage);
     } else {
-        left = "共 " + std::to_string(entries.size()) + " 个项目";
+        left = i18n::tf(i18n::Key::StatusTotal, entries.size(),
+                        i18n::itemWord(entries.size()).c_str());
         int sc = 0;
         uintmax_t sb = 0;
         for (const auto& e : entries) {
@@ -1417,16 +1435,24 @@ void App::drawStatus() {
             }
         }
         if (sc > 0) {
-            left += "，已选择 " + std::to_string(sc) + " 个项目";
+            left += i18n::tf(i18n::Key::StatusSelected, (std::size_t)sc,
+                             i18n::itemWord((std::size_t)sc).c_str());
             if (sb > 0)
-                left += "（" + humanSize(sb) + "）";
+                left += i18n::tf(i18n::Key::StatusSelectedSize,
+                                 humanSize(sb).c_str());
         }
-        if (!clipboard.empty())
-            left += "    剪贴板: " + std::to_string(clipboard.size()) + " 个项目" +
-                    (clipboardCut ? "（剪切）" : "（复制）");
+        if (!clipboard.empty()) {
+            std::string suffix = i18n::tr(clipboardCut ? i18n::Key::ClipboardCutSuffix
+                                                       : i18n::Key::ClipboardCopySuffix);
+            left += i18n::tf(i18n::Key::StatusClipboard, clipboard.size(),
+                             i18n::itemWord(clipboard.size()).c_str(),
+                             suffix.c_str());
+        }
     }
 
-    std::string right = "可用空间 " + (freeOk ? humanSize(freeBytes) : std::string("未知"));
+    std::string freeText = freeOk ? humanSize(freeBytes)
+                                  : i18n::tr(i18n::Key::Unknown);
+    std::string right = i18n::tf(i18n::Key::FreeSpace, freeText.c_str());
     int rw = utf8Cols(right);
     int rx = COLS - rw - 1;
     if (rx > 1)
@@ -1530,7 +1556,8 @@ void App::refresh() {
         it.increment(ec);
     }
     if (ec)
-        statusMessage = "读取目录失败: " + sanitize(ec.message());
+        statusMessage = i18n::tf(i18n::Key::ReadDirFailed,
+                                 sanitize(ec.message()).c_str());
 
     sortEntries();
 
@@ -1604,7 +1631,8 @@ void App::ensureVisible() {
 void App::navigate(const fs::path& p, bool addHistory) {
     std::error_code ec;
     if (!fs::is_directory(p, ec)) {
-        statusMessage = "无法打开: " + sanitize(plat::pathToUtf8(p));
+        statusMessage = i18n::tf(i18n::Key::CannotOpen,
+                                 sanitize(plat::pathToUtf8(p)).c_str());
         return;
     }
     fs::path abs = fs::absolute(p, ec);
@@ -1715,7 +1743,8 @@ void App::selectAll() {
     selected.clear();
     for (const auto& e : entries)
         selected.insert(e.name);
-    setStatus("已全选 " + std::to_string(entries.size()) + " 个项目");
+    setStatus(i18n::tf(i18n::Key::SelectAllDone, entries.size(),
+                       i18n::itemWord(entries.size()).c_str()));
 }
 
 void App::moveCursor(int delta) {
@@ -1781,7 +1810,7 @@ bool App::inTrash() const {
 
 std::string App::displayName(const fs::path& p) const {
     if (!trashFiles.empty() && samePath(p, trashFiles))
-        return "回收站";
+        return i18n::tr(i18n::Key::Trash);
     std::string name = plat::pathToUtf8(p.filename());
     return name.empty() ? plat::rootLabel(p) : name;
 }
@@ -1844,11 +1873,15 @@ void App::moveToTrash(const std::vector<fs::path>& items) {
     }
 
     refresh();
-    if (fail > 0)
-        infoDialog("回收站", {"已移入回收站 " + std::to_string(ok) + " 个项目，",
-                              std::to_string(fail) + " 个失败。"});
-    else
-        setStatus("已移入回收站 " + std::to_string(ok) + " 个项目");
+    if (fail > 0) {
+        std::string msg = i18n::tf(i18n::Key::MovedToTrashInfo, (std::size_t)ok,
+                                   i18n::itemWord((std::size_t)ok).c_str(),
+                                   (std::size_t)fail);
+        infoDialog(i18n::tr(i18n::Key::Trash), {msg});
+    } else {
+        setStatus(i18n::tf(i18n::Key::MoveToTrashDone, (std::size_t)ok,
+                           i18n::itemWord((std::size_t)ok).c_str()));
+    }
 }
 
 void App::trashDeleteSelection(const std::vector<fs::path>& items) {
@@ -1867,11 +1900,15 @@ void App::trashDeleteSelection(const std::vector<fs::path>& items) {
         ok++;
     }
     refresh();
-    if (fail > 0)
-        infoDialog("永久删除", {"已永久删除 " + std::to_string(ok) + " 个项目，",
-                                std::to_string(fail) + " 个删除失败。"});
-    else
-        setStatus("已永久删除 " + std::to_string(ok) + " 个项目");
+    if (fail > 0) {
+        std::string msg = i18n::tf(i18n::Key::PermanentDeleteInfo, (std::size_t)ok,
+                                   i18n::itemWord((std::size_t)ok).c_str(),
+                                   (std::size_t)fail);
+        infoDialog(i18n::tr(i18n::Key::PermanentDelete), {msg});
+    } else {
+        setStatus(i18n::tf(i18n::Key::PermanentDeleteDone, (std::size_t)ok,
+                           i18n::itemWord((std::size_t)ok).c_str()));
+    }
 }
 
 void App::restoreSelection() {
@@ -1879,7 +1916,7 @@ void App::restoreSelection() {
         return;
     std::vector<fs::path> items = selectionPaths();
     if (items.empty()) {
-        setStatus("没有可还原的项目");
+        setStatus(i18n::tr(i18n::Key::NoRestore));
         return;
     }
 
@@ -1921,17 +1958,22 @@ void App::restoreSelection() {
     }
 
     refresh();
-    if (fail > 0)
-        infoDialog("还原", {"已还原 " + std::to_string(ok) + " 个项目，",
-                            std::to_string(fail) + " 个失败（可能缺少回收站信息）。"});
-    else
-        setStatus("已还原 " + std::to_string(ok) + " 个项目");
+    if (fail > 0) {
+        std::string msg = i18n::tf(i18n::Key::RestoreInfo, (std::size_t)ok,
+                                   i18n::itemWord((std::size_t)ok).c_str(),
+                                   (std::size_t)fail);
+        infoDialog(i18n::tr(i18n::Key::Restore), {msg});
+    } else {
+        setStatus(i18n::tf(i18n::Key::RestoreDone, (std::size_t)ok,
+                           i18n::itemWord((std::size_t)ok).c_str()));
+    }
 }
 
 void App::emptyTrash() {
     if (!inTrash())
         return;
-    if (!confirmDialog("清空回收站", "确定要永久删除回收站中的所有项目吗？\n此操作无法撤销。"))
+    if (!confirmDialog(i18n::tr(i18n::Key::EmptyTrash),
+                       i18n::tr(i18n::Key::EmptyTrashConfirm)))
         return;
 
     int fail = 0;
@@ -1951,24 +1993,28 @@ void App::emptyTrash() {
 
     refresh();
     if (fail > 0)
-        infoDialog("清空回收站", {"有 " + std::to_string(fail) + " 个项目删除失败。"});
+        infoDialog(i18n::tr(i18n::Key::EmptyTrash),
+                   {i18n::tf(i18n::Key::EmptyTrashFail, (std::size_t)fail,
+                             i18n::itemWord((std::size_t)fail).c_str())});
     else
-        setStatus("回收站已清空");
+        setStatus(i18n::tr(i18n::Key::TrashEmptied));
 }
 
 void App::copySel(bool cut) {
     if (inTrash()) {
-        setStatus("回收站中不能复制或剪切，请使用“还原”");
+        setStatus(i18n::tr(i18n::Key::TrashNoCopy));
         return;
     }
     std::vector<fs::path> items = selectionPaths();
     if (items.empty()) {
-        setStatus("没有选中的项目");
+        setStatus(i18n::tr(i18n::Key::NoSelection));
         return;
     }
     clipboard = items;
     clipboardCut = cut;
-    setStatus(std::string(cut ? "已剪切 " : "已复制 ") + std::to_string(items.size()) + " 个项目");
+    setStatus(i18n::tf(cut ? i18n::Key::CutDone : i18n::Key::Copied,
+                       items.size(),
+                       i18n::itemWord(items.size()).c_str()));
 }
 
 std::string App::uniqueName(const fs::path& dir, const std::string& base) const {
@@ -1987,12 +2033,13 @@ std::string App::uniqueCopyName(const fs::path& dir, const std::string& filename
     fs::path fp = plat::pathFromUtf8(filename);
     std::string stem = plat::pathToUtf8(fp.stem());
     std::string ext = plat::pathToUtf8(fp.extension());
-    std::string base = stem + " - 副本" + ext;
+    std::string base = stem + i18n::tr(i18n::Key::CopySuffix) + ext;
     std::error_code ec;
     if (!fs::exists(plat::joinPath(dir, base), ec))
         return base;
     for (int i = 2; i < 10000; ++i) {
-        std::string n = stem + " - 副本 (" + std::to_string(i) + ")" + ext;
+        std::string n = stem + i18n::tr(i18n::Key::CopySuffix) +
+                        " (" + std::to_string(i) + ")" + ext;
         if (!fs::exists(plat::joinPath(dir, n), ec))
             return n;
     }
@@ -2001,11 +2048,11 @@ std::string App::uniqueCopyName(const fs::path& dir, const std::string& filename
 
 void App::paste() {
     if (inTrash()) {
-        setStatus("回收站中不能粘贴");
+        setStatus(i18n::tr(i18n::Key::TrashNoPaste));
         return;
     }
     if (clipboard.empty()) {
-        setStatus("剪贴板为空");
+        setStatus(i18n::tr(i18n::Key::ClipboardEmpty));
         return;
     }
     fs::path target = current;
@@ -2031,11 +2078,10 @@ void App::paste() {
             dst = plat::joinPath(
                 target, uniqueCopyName(target, plat::pathToUtf8(src.filename())));
         } else if (fs::exists(dst, ec)) {
-            bool ow = confirmDialog("确认替换", "目标位置已存在同名项目：\n" +
-                                                      sanitize(plat::pathToUtf8(
-                                                          src.filename())) +
-                                                      "\n\n是否替换？");
-            if (!ow) {
+            std::string msg = i18n::tf(
+                i18n::Key::ReplaceConfirm,
+                sanitize(plat::pathToUtf8(src.filename())).c_str());
+            if (!confirmDialog(i18n::tr(i18n::Key::ConfirmReplaceTitle), msg)) {
                 skipped++;
                 continue;
             }
@@ -2073,15 +2119,16 @@ void App::paste() {
 
     refresh();
     if (failed > 0) {
-        infoDialog("粘贴",
-                   {"操作已完成。",
-                    "成功: " + std::to_string(done) + " 个",
-                    "跳过: " + std::to_string(skipped) + " 个",
-                    "失败: " + std::to_string(failed) + " 个"});
+        infoDialog(i18n::tr(i18n::Key::Paste),
+                   {i18n::tr(i18n::Key::PasteCompleted),
+                    i18n::tf(i18n::Key::SuccessCount, (std::size_t)done),
+                    i18n::tf(i18n::Key::SkippedCount, (std::size_t)skipped),
+                    i18n::tf(i18n::Key::FailedCount, (std::size_t)failed)});
     } else {
-        std::string msg = "粘贴完成：" + std::to_string(done) + " 个项目";
+        std::string msg = i18n::tf(i18n::Key::PasteDoneStatus, (std::size_t)done,
+                                   i18n::itemWord((std::size_t)done).c_str());
         if (skipped > 0)
-            msg += "，跳过 " + std::to_string(skipped) + " 个";
+            msg += i18n::tf(i18n::Key::PasteSkipped, (std::size_t)skipped);
         setStatus(msg);
     }
 }
@@ -2089,45 +2136,51 @@ void App::paste() {
 void App::deleteSelection() {
     std::vector<fs::path> items = selectionPaths();
     if (items.empty()) {
-        setStatus("没有可删除的项目");
+        setStatus(i18n::tr(i18n::Key::NoDeletable));
         return;
     }
     if (inTrash()) {
-        std::string msg = "确定要永久删除选中的 " + std::to_string(items.size()) +
-                          " 个项目吗？\n此操作无法撤销。";
-        if (!confirmDialog("永久删除", msg))
+        std::string msg = i18n::tf(
+            i18n::Key::PermanentDeleteConfirm, items.size(),
+            i18n::itemWord(items.size()).c_str());
+        if (!confirmDialog(i18n::tr(i18n::Key::PermanentDelete), msg))
             return;
         trashDeleteSelection(items);
         return;
     }
 
-    std::string msg = "确定要将选中的 " + std::to_string(items.size()) +
-                      " 个项目移到回收站吗？";
-    if (!confirmDialog("移到回收站", msg))
+    std::string msg = i18n::tf(i18n::Key::MoveToTrashConfirm, items.size(),
+                               i18n::itemWord(items.size()).c_str());
+    if (!confirmDialog(i18n::tr(i18n::Key::MoveToTrashTitle), msg))
         return;
     moveToTrash(items);
 }
 
 void App::newFolder() {
     if (inTrash()) {
-        setStatus("回收站中不能新建文件夹");
+        setStatus(i18n::tr(i18n::Key::TrashNoNewFolder));
         return;
     }
-    std::string name = uniqueName(current, "新建文件夹");
-    if (!inputDialog("新建文件夹", "文件夹名称:", name))
+    std::string name = uniqueName(current, i18n::tr(i18n::Key::NewFolder));
+    if (!inputDialog(i18n::tr(i18n::Key::NewFolder),
+                     i18n::tr(i18n::Key::FolderName), name))
         return;
     if (!plat::validFileName(name)) {
-        infoDialog("新建文件夹", {"名称无效。"});
+        infoDialog(i18n::tr(i18n::Key::NewFolder),
+                   {i18n::tr(i18n::Key::InvalidName)});
         return;
     }
     fs::path p = plat::joinPath(current, name);
     std::error_code ec;
     if (fs::exists(p, ec)) {
-        infoDialog("新建文件夹", {"该名称已存在。"});
+        infoDialog(i18n::tr(i18n::Key::NewFolder),
+                   {i18n::tr(i18n::Key::NameExists)});
         return;
     }
     if (!fs::create_directory(p, ec)) {
-        infoDialog("新建文件夹", {"创建失败: " + sanitize(ec.message())});
+        infoDialog(i18n::tr(i18n::Key::NewFolder),
+                   {i18n::tf(i18n::Key::CreateFailed,
+                             sanitize(ec.message()).c_str())});
         return;
     }
     refresh();
@@ -2137,22 +2190,24 @@ void App::newFolder() {
             break;
         }
     }
-    setStatus("已创建文件夹: " + sanitize(name));
+    setStatus(i18n::tf(i18n::Key::CreatedFolder, sanitize(name).c_str()));
 }
 
 void App::renameCurrent() {
     if (inTrash()) {
-        setStatus("回收站中不能重命名");
+        setStatus(i18n::tr(i18n::Key::TrashNoRename));
         return;
     }
     if (entries.empty() || cursor < 0 || cursor >= (int)entries.size())
         return;
     Entry e = entries[cursor];
     std::string name = e.name;
-    if (!inputDialog("重命名", "新名称:", name))
+    if (!inputDialog(i18n::tr(i18n::Key::Rename),
+                     i18n::tr(i18n::Key::NewName), name))
         return;
     if (!plat::validFileName(name)) {
-        infoDialog("重命名", {"名称无效。"});
+        infoDialog(i18n::tr(i18n::Key::Rename),
+                   {i18n::tr(i18n::Key::InvalidName)});
         return;
     }
     if (name == e.name)
@@ -2160,12 +2215,15 @@ void App::renameCurrent() {
     fs::path dst = plat::joinPath(e.path.parent_path(), name);
     std::error_code ec;
     if (fs::exists(dst, ec)) {
-        infoDialog("重命名", {"该名称已存在。"});
+        infoDialog(i18n::tr(i18n::Key::Rename),
+                   {i18n::tr(i18n::Key::NameExists)});
         return;
     }
     fs::rename(e.path, dst, ec);
     if (ec) {
-        infoDialog("重命名", {"重命名失败: " + sanitize(ec.message())});
+        infoDialog(i18n::tr(i18n::Key::Rename),
+                   {i18n::tf(i18n::Key::RenameFailed,
+                             sanitize(ec.message()).c_str())});
         return;
     }
     refresh();
@@ -2175,7 +2233,7 @@ void App::renameCurrent() {
             break;
         }
     }
-    setStatus("已重命名: " + sanitize(name));
+    setStatus(i18n::tf(i18n::Key::Renamed, sanitize(name).c_str()));
 }
 
 void App::showProperties() {
@@ -2183,32 +2241,56 @@ void App::showProperties() {
         return;
     const Entry& e = entries[cursor];
     std::vector<std::string> lines;
-    lines.push_back("名称: " + sanitize(e.name));
-    lines.push_back("位置: " + sanitize(plat::pathToUtf8(current)));
-    lines.push_back("类型: " + e.type);
-    lines.push_back("大小: " + (e.isDir ? std::string("—") : humanSize(e.size)));
-    lines.push_back("修改时间: " + formatTime(e.mtime));
-    lines.push_back("完整路径: " + sanitize(plat::pathToUtf8(e.path)));
-    infoDialog("属性", lines);
+    lines.push_back(i18n::tf(i18n::Key::PropertiesName, sanitize(e.name).c_str()));
+    lines.push_back(i18n::tf(i18n::Key::PropertiesLocation,
+                             sanitize(plat::pathToUtf8(current)).c_str()));
+    lines.push_back(i18n::tf(i18n::Key::PropertiesType, e.type.c_str()));
+    std::string sizeText = e.isDir ? std::string("—") : humanSize(e.size);
+    lines.push_back(i18n::tf(i18n::Key::PropertiesSize, sizeText.c_str()));
+    lines.push_back(i18n::tf(i18n::Key::PropertiesModified,
+                             formatTime(e.mtime).c_str()));
+    lines.push_back(i18n::tf(i18n::Key::PropertiesFullPath,
+                             sanitize(plat::pathToUtf8(e.path)).c_str()));
+    infoDialog(i18n::tr(i18n::Key::Properties), lines);
 }
 
 void App::showHelp() {
-    infoDialog("帮助", {
-                           "动作菜单：按 a 或右键打开；右上角 × 退出程序。",
-                           "标签页：Ctrl+T 新建，Ctrl+W 关闭，Tab / Ctrl+Tab 下一个，Shift+Tab 上一个。",
-                           "标签操作：点击标签切换，点击标签上的 × 或中键关闭。",
-                           "导航：↑↓ 移动，PgUp/PgDn 翻页，Home/End 首尾，Enter 打开。",
-                           "导航：Backspace 后退，Ctrl+U 上一级，Ctrl+B 显示/隐藏侧栏。",
-                           "地址栏：‹ 后退，› 前进，↑ 上一级；点击面包屑跳转。",
-                           "文件：F1 帮助，F2 重命名，F4 属性，F5 刷新，F7 新建文件夹。",
-                           "文件：Del 删除，F9 显示隐藏，F10 退出。",
-                           "编辑：Ctrl+C 复制，Ctrl+X 剪切，Ctrl+V 粘贴，Ctrl+A 全选。",
-                           "鼠标：单击选择，双击打开，滚轮滚动，右键菜单。",
-                           "多选：Shift+单击 连续，Ctrl+单击 多选。",
-                           "打开：文件夹进入下一级；文件用系统默认程序打开。",
-                           "回收站：删除的项目移入左侧回收站；在其中可还原或永久删除。",
-                           "Esc 清除状态；直接输入文件名前缀可快速定位。",
-                       });
+    infoDialog(i18n::tr(i18n::Key::Help), {
+        i18n::tr(i18n::Key::HelpLine1),
+        i18n::tr(i18n::Key::HelpLine2),
+        i18n::tr(i18n::Key::HelpLine3),
+        i18n::tr(i18n::Key::HelpLine4),
+        i18n::tr(i18n::Key::HelpLine5),
+        i18n::tr(i18n::Key::HelpLine6),
+        i18n::tr(i18n::Key::HelpLine7),
+        i18n::tr(i18n::Key::HelpLine8),
+        i18n::tr(i18n::Key::HelpLine9),
+        i18n::tr(i18n::Key::HelpLine10),
+        i18n::tr(i18n::Key::HelpLine11),
+        i18n::tr(i18n::Key::HelpLine12),
+        i18n::tr(i18n::Key::HelpLine13),
+        i18n::tr(i18n::Key::HelpLine14),
+    });
+}
+
+void App::chooseLanguage() {
+    std::vector<std::string> buttons;
+    static const char* shortNames[] = {"EN", "ZH", "TW", "MEME"};
+    bool narrow = COLS < 60;
+    for (int i = 0; i < 4; ++i) {
+        buttons.push_back(narrow ? shortNames[i]
+                                 : i18n::languageName(static_cast<i18n::Lang>(i)));
+    }
+    int currentLang = static_cast<int>(i18n::language());
+    int choice = showDialog(i18n::tr(i18n::Key::SelectLanguage),
+                            {i18n::tr(i18n::Key::SelectLanguageHint)},
+                            buttons, currentLang);
+    if (choice < 0 || choice == currentLang)
+        return;
+    i18n::setLanguage(static_cast<i18n::Lang>(choice));
+    rebuildQuickItems();
+    refresh();
+    setStatus(i18n::tr(i18n::Key::LanguageChanged));
 }
 
 void App::handleMouse() {
@@ -2491,7 +2573,8 @@ void App::executeCmd(Cmd cmd) {
     case CMD_TOGGLEHIDDEN:
         showHidden = !showHidden;
         refresh();
-        setStatus(showHidden ? "显示隐藏项目" : "隐藏隐藏项目");
+        setStatus(i18n::tr(showHidden ? i18n::Key::ShowHiddenStatus
+                                     : i18n::Key::HideHiddenStatus));
         break;
     case CMD_TOGGLESIDEBAR:
         showSidebar = !showSidebar;
@@ -2509,6 +2592,9 @@ void App::executeCmd(Cmd cmd) {
     case CMD_SORT_SIZE:
         applySort(SortKey::Size);
         break;
+    case CMD_LANGUAGE:
+        chooseLanguage();
+        break;
     case CMD_HELP:
         showHelp();
         break;
@@ -2523,9 +2609,9 @@ void App::executeCmd(Cmd cmd) {
 void App::showActionMenu(int px, int py) {
     computeLayout();
     bool has = !entries.empty();
-    auto sortLabel = [&](const char* what, SortKey key) {
-        std::string s = std::string("按") + what + "排序";
-        if (sortKey == key)
+    auto sortLabel = [&](i18n::Key key, SortKey k) {
+        std::string s = i18n::tr(key);
+        if (sortKey == k)
             s += sortAsc ? " ↑" : " ↓";
         return s;
     };
@@ -2534,44 +2620,58 @@ void App::showActionMenu(int px, int py) {
     auto add = [&](Cmd cmd, const std::string& label, bool enabled, bool sep = false) {
         items.push_back({cmd, label, enabled, sep});
     };
-    add(CMD_OPEN, "打开", has);
+    add(CMD_OPEN, i18n::tr(i18n::Key::Open), has);
     add(CMD_NONE, "", false, true);
     if (trash) {
-        add(CMD_RESTORE, "还原", has);
-        add(CMD_DELETE, "永久删除", has);
-        add(CMD_EMPTY_TRASH, "清空回收站", true);
-        add(CMD_PROPERTIES, "属性", has);
+        add(CMD_RESTORE, i18n::tr(i18n::Key::Restore), has);
+        add(CMD_DELETE, i18n::tr(i18n::Key::PermanentDelete), has);
+        add(CMD_EMPTY_TRASH, i18n::tr(i18n::Key::EmptyTrash), true);
+        add(CMD_PROPERTIES, i18n::tr(i18n::Key::Properties), has);
         add(CMD_NONE, "", false, true);
-        add(CMD_REFRESH, "刷新", true);
-        add(CMD_SELECTALL, "全选", has);
-        add(CMD_TOGGLEHIDDEN, showHidden ? "隐藏隐藏项目" : "显示隐藏项目", true);
-        add(CMD_TOGGLESIDEBAR, showSidebar ? "隐藏导航窗格" : "显示导航窗格", true);
+        add(CMD_REFRESH, i18n::tr(i18n::Key::Refresh), true);
+        add(CMD_SELECTALL, i18n::tr(i18n::Key::SelectAll), has);
+        add(CMD_TOGGLEHIDDEN,
+            i18n::tr(showHidden ? i18n::Key::HideHiddenMenu
+                                : i18n::Key::ShowHiddenMenu),
+            true);
+        add(CMD_TOGGLESIDEBAR,
+            i18n::tr(showSidebar ? i18n::Key::HideSidebar
+                                 : i18n::Key::ShowSidebar),
+            true);
     } else {
-        add(CMD_COPY, "复制", has);
-        add(CMD_CUT, "剪切", has);
-        add(CMD_PASTE, "粘贴", !clipboard.empty());
-        add(CMD_RENAME, "重命名", has);
-        add(CMD_DELETE, "删除", has);
-        add(CMD_PROPERTIES, "属性", has);
+        add(CMD_COPY, i18n::tr(i18n::Key::Copy), has);
+        add(CMD_CUT, i18n::tr(i18n::Key::Cut), has);
+        add(CMD_PASTE, i18n::tr(i18n::Key::Paste), !clipboard.empty());
+        add(CMD_RENAME, i18n::tr(i18n::Key::Rename), has);
+        add(CMD_DELETE, i18n::tr(i18n::Key::Delete), has);
+        add(CMD_PROPERTIES, i18n::tr(i18n::Key::Properties), has);
         add(CMD_NONE, "", false, true);
-        add(CMD_NEWFOLDER, "新建文件夹", true);
-        add(CMD_REFRESH, "刷新", true);
-        add(CMD_SELECTALL, "全选", has);
-        add(CMD_TOGGLEHIDDEN, showHidden ? "隐藏隐藏项目" : "显示隐藏项目", true);
-        add(CMD_TOGGLESIDEBAR, showSidebar ? "隐藏导航窗格" : "显示导航窗格", true);
+        add(CMD_NEWFOLDER, i18n::tr(i18n::Key::NewFolder), true);
+        add(CMD_REFRESH, i18n::tr(i18n::Key::Refresh), true);
+        add(CMD_SELECTALL, i18n::tr(i18n::Key::SelectAll), has);
+        add(CMD_TOGGLEHIDDEN,
+            i18n::tr(showHidden ? i18n::Key::HideHiddenMenu
+                                : i18n::Key::ShowHiddenMenu),
+            true);
+        add(CMD_TOGGLESIDEBAR,
+            i18n::tr(showSidebar ? i18n::Key::HideSidebar
+                                 : i18n::Key::ShowSidebar),
+            true);
     }
     add(CMD_NONE, "", false, true);
-    add(CMD_BACK, "后退", histPos > 0);
-    add(CMD_FORWARD, "前进", histPos + 1 < (int)history.size());
-    add(CMD_UP, "上一级", current != current.root_path());
+    add(CMD_BACK, i18n::tr(i18n::Key::Back), histPos > 0);
+    add(CMD_FORWARD, i18n::tr(i18n::Key::Forward),
+        histPos + 1 < (int)history.size());
+    add(CMD_UP, i18n::tr(i18n::Key::Up), current != current.root_path());
     add(CMD_NONE, "", false, true);
-    add(CMD_SORT_NAME, sortLabel("名称", SortKey::Name), true);
-    add(CMD_SORT_DATE, sortLabel("日期", SortKey::Date), true);
-    add(CMD_SORT_TYPE, sortLabel("类型", SortKey::Type), true);
-    add(CMD_SORT_SIZE, sortLabel("大小", SortKey::Size), true);
+    add(CMD_SORT_NAME, sortLabel(i18n::Key::SortByName, SortKey::Name), true);
+    add(CMD_SORT_DATE, sortLabel(i18n::Key::SortByDate, SortKey::Date), true);
+    add(CMD_SORT_TYPE, sortLabel(i18n::Key::SortByType, SortKey::Type), true);
+    add(CMD_SORT_SIZE, sortLabel(i18n::Key::SortBySize, SortKey::Size), true);
     add(CMD_NONE, "", false, true);
-    add(CMD_HELP, "帮助", true);
-    add(CMD_QUIT, "退出", true);
+    add(CMD_LANGUAGE, i18n::tr(i18n::Key::Language), true);
+    add(CMD_HELP, i18n::tr(i18n::Key::Help), true);
+    add(CMD_QUIT, i18n::tr(i18n::Key::Quit), true);
     if (px < 0)
         px = listX + 2;
     if (py < 0)
@@ -2629,7 +2729,8 @@ bool App::processKey(int k) {
     case KEY_F(9):
         showHidden = !showHidden;
         refresh();
-        setStatus(showHidden ? "显示隐藏项目" : "隐藏隐藏项目");
+        setStatus(i18n::tr(showHidden ? i18n::Key::ShowHiddenStatus
+                                     : i18n::Key::HideHiddenStatus));
         break;
     case KEY_F(10):
         return true;
@@ -2721,8 +2822,12 @@ int App::showDialog(const std::string& title, const std::vector<std::string>& ra
     int maxCols = 30;
     for (const auto& l : rawLines)
         maxCols = std::max(maxCols, utf8Cols(l));
+    int buttonsW = 0;
     for (const auto& b : buttons)
-        maxCols = std::max(maxCols, dlgButtonW(b) + 2);
+        buttonsW += dlgButtonW(b) + 2;
+    if (!buttons.empty())
+        buttonsW -= 2;
+    maxCols = std::max(maxCols, buttonsW + 4);
     maxCols = std::max(maxCols, utf8Cols(title) + 4);
 
     int w = std::min(COLS - 4, std::max(42, maxCols + 6));
@@ -2843,11 +2948,13 @@ int App::showDialog(const std::string& title, const std::vector<std::string>& ra
 }
 
 bool App::confirmDialog(const std::string& title, const std::string& message) {
-    return showDialog(title, {message}, {"是", "否"}, 0) == 0;
+    return showDialog(title, {message},
+                      {i18n::tr(i18n::Key::Yes), i18n::tr(i18n::Key::No)},
+                      0) == 0;
 }
 
 void App::infoDialog(const std::string& title, const std::vector<std::string>& lines) {
-    showDialog(title, lines, {"确定"}, 0);
+    showDialog(title, lines, {i18n::tr(i18n::Key::Ok)}, 0);
 }
 
 bool App::inputDialog(const std::string& title, const std::string& label, std::string& value) {
@@ -2870,8 +2977,10 @@ bool App::inputDialog(const std::string& title, const std::string& label, std::s
     int fieldY = 3;
     int fieldX = 2;
     int fieldW = w - 4;
-    int bw1 = dlgButtonW("确定");
-    int bw2 = dlgButtonW("取消");
+    std::string okLabel = i18n::tr(i18n::Key::Ok);
+    std::string cancelLabel = i18n::tr(i18n::Key::Cancel);
+    int bw1 = dlgButtonW(okLabel);
+    int bw2 = dlgButtonW(cancelLabel);
     int total = bw1 + bw2 + 2;
     int bx = std::max(2, (w - total) / 2);
     int okX = bx;
@@ -2910,9 +3019,9 @@ bool App::inputDialog(const std::string& title, const std::string& label, std::s
             else if (mouseX >= noX && mouseX < noX + bw2)
                 hoverBtn = 1;
         }
-        drawDlgButton(win, btnY, okX, "确定", true, hoverBtn == 0,
+        drawDlgButton(win, btnY, okX, okLabel, true, hoverBtn == 0,
                       attrHover, attrSelHover);
-        drawDlgButton(win, btnY, noX, "取消", false, hoverBtn == 1,
+        drawDlgButton(win, btnY, noX, cancelLabel, false, hoverBtn == 1,
                       attrHover, attrSelHover);
         wrefresh(win);
 
@@ -3189,23 +3298,59 @@ App::Cmd App::popupMenu(const std::vector<MenuItem>& items, int px, int py) {
 int main(int argc, char** argv) {
     plat::initConsole();
     std::vector<std::string> args = plat::commandLineArgs(argc, argv);
-    if (args.size() > 1) {
-        const std::string& arg = args[1];
+    i18n::setLanguage(i18n::detectLanguage());
+
+    fs::path start;
+    bool haveStart = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
         if (arg == "-h" || arg == "--help") {
-            std::printf("用法: %s [目录]\n", args[0].c_str());
-            std::printf("TExplorer — 简易 TUI 文件资源管理器（支持鼠标）。\n");
+            std::printf(i18n::text(i18n::Key::Usage), args[0].c_str());
+            std::printf("%s", i18n::text(i18n::Key::AppDescription));
+            std::printf("%s", i18n::text(i18n::Key::HelpOption));
+            std::printf("%s", i18n::text(i18n::Key::LangOption));
             return 0;
         }
+        if (arg == "--lang") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "%s", i18n::text(i18n::Key::LangRequired));
+                return 1;
+            }
+            const std::string& value = args[++i];
+            i18n::Lang lang;
+            if (!i18n::parseLanguage(value, lang)) {
+                std::fprintf(stderr, i18n::text(i18n::Key::UnknownLanguage),
+                             value.c_str());
+                return 1;
+            }
+            i18n::setLanguage(lang);
+            continue;
+        }
+        if (arg.rfind("--lang=", 0) == 0) {
+            const std::string value = arg.substr(7);
+            i18n::Lang lang;
+            if (!i18n::parseLanguage(value, lang)) {
+                std::fprintf(stderr, i18n::text(i18n::Key::UnknownLanguage),
+                             value.c_str());
+                return 1;
+            }
+            i18n::setLanguage(lang);
+            continue;
+        }
+        if (!haveStart) {
+            start = plat::pathFromUtf8(arg);
+            haveStart = true;
+        }
     }
+    if (!haveStart)
+        start = fs::current_path();
 
-    fs::path start = (args.size() > 1) ? plat::pathFromUtf8(args[1])
-                                       : fs::current_path();
     try {
         App app(start);
         app.run();
     } catch (const std::exception& e) {
         endwin();
-        std::fprintf(stderr, "错误: %s\n", e.what());
+        std::fprintf(stderr, i18n::text(i18n::Key::ErrorPrefix), e.what());
         return 1;
     }
     return 0;

@@ -1,3 +1,4 @@
+#include "i18n.h"
 #include "platform.h"
 
 #include <algorithm>
@@ -237,17 +238,17 @@ std::vector<Location> userLocations() {
     struct Def {
         REFKNOWNFOLDERID id;
         const char* icon;
-        const char* label;
+        i18n::Key label;
         const wchar_t* sub;
     };
     static const Def defs[] = {
-        {FOLDERID_Profile, "~", "主页", nullptr},
-        {FOLDERID_Desktop, "▣", "桌面", L"Desktop"},
-        {FOLDERID_Documents, "▤", "文档", L"Documents"},
-        {FOLDERID_Downloads, "↓", "下载", L"Downloads"},
-        {FOLDERID_Pictures, "▦", "图片", L"Pictures"},
-        {FOLDERID_Music, "♪", "音乐", L"Music"},
-        {FOLDERID_Videos, "▷", "视频", L"Videos"},
+        {FOLDERID_Profile, "~", i18n::Key::Home, nullptr},
+        {FOLDERID_Desktop, "▣", i18n::Key::Desktop, L"Desktop"},
+        {FOLDERID_Documents, "▤", i18n::Key::Documents, L"Documents"},
+        {FOLDERID_Downloads, "↓", i18n::Key::Downloads, L"Downloads"},
+        {FOLDERID_Pictures, "▦", i18n::Key::Pictures, L"Pictures"},
+        {FOLDERID_Music, "♪", i18n::Key::Music, L"Music"},
+        {FOLDERID_Videos, "▷", i18n::Key::Videos, L"Videos"},
     };
     for (const auto& d : defs) {
         fs::path p = knownFolder(d.id);
@@ -257,25 +258,28 @@ std::vector<Location> userLocations() {
             p = d.sub ? (home / d.sub) : home;
         }
         if (!p.empty() && fs::is_directory(p, ec))
-            out.push_back({d.icon, d.label, p});
+            out.push_back({d.icon, i18n::tr(d.label), p});
     }
 #else
     struct Def {
         const char* icon;
-        const char* label;
+        i18n::Key label;
         const char* sub;
     };
     static const Def defs[] = {
-        {"~", "主页", nullptr},       {"▣", "桌面", "Desktop"},
-        {"▤", "文档", "Documents"},   {"↓", "下载", "Downloads"},
-        {"▦", "图片", "Pictures"},    {"♪", "音乐", "Music"},
-        {"▷", "视频", "Videos"},
+        {"~", i18n::Key::Home, nullptr},
+        {"▣", i18n::Key::Desktop, "Desktop"},
+        {"▤", i18n::Key::Documents, "Documents"},
+        {"↓", i18n::Key::Downloads, "Downloads"},
+        {"▦", i18n::Key::Pictures, "Pictures"},
+        {"♪", i18n::Key::Music, "Music"},
+        {"▷", i18n::Key::Videos, "Videos"},
     };
     for (const auto& d : defs) {
         fs::path p = d.sub ? (home / d.sub) : home;
         std::error_code ec;
         if (fs::is_directory(p, ec))
-            out.push_back({d.icon, d.label, p});
+            out.push_back({d.icon, i18n::tr(d.label), p});
     }
 #endif
     return out;
@@ -300,7 +304,7 @@ std::vector<Location> rootLocations() {
     if (out.empty())
         out.push_back({"▣", "C:\\", fs::path(L"C:\\")});
 #else
-    out.push_back({"/", "根目录", fs::path("/")});
+    out.push_back({"/", i18n::tr(i18n::Key::Root), fs::path("/")});
 #endif
     return out;
 }
@@ -409,10 +413,13 @@ OpenOutcome openExternal(const fs::path& p, const fs::path& cwd,
     std::intptr_t code = (std::intptr_t)r;
     if (code > 32) {
         o.ok = true;
-        o.message = (executable ? "已运行 " : "已打开 ") + pathToUtf8(p.filename());
+        o.message = i18n::tf(executable ? i18n::Key::RunDone
+                                        : i18n::Key::OpenDone,
+                             pathToUtf8(p.filename()).c_str());
     } else {
         o.ok = false;
-        o.message = "无法打开: " + pathToUtf8(p.filename());
+        o.message = i18n::tf(i18n::Key::CannotOpen,
+                             pathToUtf8(p.filename()).c_str());
     }
 #else
     pid_t pid = fork();
@@ -431,15 +438,20 @@ OpenOutcome openExternal(const fs::path& p, const fs::path& cwd,
 
     if (pid < 0) {
         o.ok = false;
-        o.message = "无法启动进程";
+        o.message = i18n::tr(i18n::Key::ProcessStartFailed);
     } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
         o.ok = false;
-        o.message = executable ? ("无法运行: " + pathToUtf8(p.filename()))
-                               : "无法启动 nano";
+        o.message = executable
+                        ? i18n::tf(i18n::Key::RunFailed,
+                                   pathToUtf8(p.filename()).c_str())
+                        : i18n::tr(i18n::Key::NanoStartFailed);
     } else {
         o.ok = true;
-        o.message = executable ? ("已运行 " + pathToUtf8(p.filename()))
-                               : ("已用 nano 编辑 " + pathToUtf8(p.filename()));
+        o.message = executable
+                        ? i18n::tf(i18n::Key::RunDone,
+                                   pathToUtf8(p.filename()).c_str())
+                        : i18n::tf(i18n::Key::NanoEdited,
+                                   pathToUtf8(p.filename()).c_str());
     }
 #endif
     return o;

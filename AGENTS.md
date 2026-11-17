@@ -6,7 +6,7 @@
 
 TExplorer 是一个 C++17 终端文件管理器，界面和操作方式参考 Windows 资源管理器。
 支持目录浏览、标签页、面包屑导航、文件操作、回收站、鼠标操作、排序、隐藏文件、
-窄终端自适应布局，以及 Linux / macOS / Windows 平台。
+多语言界面、窄终端自适应布局，以及 Linux / macOS / Windows 平台。
 
 - Linux：ncursesw
 - macOS：系统 curses
@@ -59,12 +59,15 @@ where.exe ninja
 └── src
     ├── main.cpp
     ├── platform.h
-    └── platform.cpp
+    ├── platform.cpp
+    ├── i18n.h
+    └── i18n.cpp
 ```
 
 - `src/main.cpp`：UI、事件循环、布局、绘制、鼠标、标签页、文件操作、对话框。
 - `src/platform.h`：平台抽象接口。
 - `src/platform.cpp`：Linux / macOS / Windows 平台实现。
+- `src/i18n.h` / `src/i18n.cpp`：多语言枚举、文本表、语言检测与格式化。
 - `CMakeLists.txt`：跨平台构建配置。
 - `README.md`：面向用户的文档；行为变化时同步更新。
 - `install.sh` / `uninstall.sh`：Linux 安装与卸载。
@@ -86,6 +89,8 @@ where.exe ninja
 - 操作：`navigate()`、`openCurrent()`、`copySel()`、`paste()`、`deleteSelection()`、
   `moveToTrash()`、`restoreSelection()` 等。
 - 对话框：`showDialog()`、`inputDialog()`、`popupMenu()`，各自是独立窗口和事件循环。
+- 多语言：`chooseLanguage()` 切换语言，`rebuildQuickItems()` 重建侧边栏；
+  文本统一通过 `i18n::tr()` / `i18n::tf()` 获取。
 
 ### 平台抽象
 
@@ -109,6 +114,22 @@ where.exe ninja
 - 使用 `wput()` 写入固定宽度的文本，它会自动填充空格并应用属性。
 - 内部路径使用 `fs::path`；与 UI/字符串交互时再转换为 UTF-8。
 - 避免在源码中直接拼接设备相关的绝对路径。
+
+### 多语言文本
+
+- 所有用户可见文本都应通过 `i18n::tr(Key)` 或 `i18n::tf(Key, ...)` 获取，
+  不要在 `main.cpp` / `platform.cpp` 中新增硬编码界面文字。
+- `src/i18n.h` 定义 `Lang` 和 `Key`；`src/i18n.cpp` 的文本表按
+  English / 简体中文 / 繁體中文 / 梗体中文四列维护。
+- 新增文本时同时补齐四个语言；格式串使用 `%s`、`%zu`、`%%`，并保持参数顺序一致。
+- 英文单复数使用 `i18n::itemWord(n)`；中文可复用同一词。
+- `i18n::detectLanguage()` 依次检查 `TEXPLORER_LANG`、`LC_ALL`、`LC_MESSAGES`、
+  `LANG`，无法识别时回退到简体中文。
+- 启动参数 `--lang en|zh|zh_TW|meme`；运行中通过动作菜单的“语言”项切换。
+- 切换语言后调用 `rebuildQuickItems()` 和 `refresh()`，使侧边栏、表头、状态栏等立即更新。
+- `plat::userLocations()` / `rootLocations()` 的标签也使用 `i18n`，不要在平台层硬编码。
+- 不要用 `OK` 作为 `Key` 名称：curses 会定义同名宏，使用 `Key::Ok`。
+- 梗体中文包含刻意加入的 Linux 梗；调整文案时保留这种风格，不要改成正式翻译。
 
 ### 布局与命中测试
 
@@ -161,6 +182,9 @@ Linux / macOS：
 cmake -S . -B build
 cmake --build build -j
 ./build/TExplorer [目录]
+./build/TExplorer --lang en [目录]
+./build/TExplorer --lang zh_TW [目录]
+./build/TExplorer --lang meme [目录]
 ```
 
 Windows（MinGW-w64 + Ninja）：
@@ -211,6 +235,8 @@ cmake --build build
    - 鼠标点击、双击、滚轮、悬停、滚动条拖动
    - 窄终端和窗口 resize
    - 中文、emoji、宽字符截断
+   - 四种界面语言、`--lang`、`TEXPLORER_LANG` 和动作菜单语言切换
+   - 窄终端下的语言选择对话框
    - 回收站操作
    - Linux 下 `nano` 打开/退出后的 TUI 恢复
    - Windows 下的路径、磁盘列表、默认程序打开（如环境可用）
@@ -269,6 +295,7 @@ set -g mouse on
 - 不引入新依赖，除非确有必要并说明原因。
 - 优先使用 `plat::` 抽象，不要把平台逻辑散落在 `main.cpp`。
 - 所有显示文本按 UTF-8 处理，使用已有的宽度计算工具。
+- 新增或修改用户可见文本时，必须同步更新 `src/i18n.cpp` 的四种语言。
 - 不要用设备相关的绝对路径写文档或示例；使用 `./build`、`~/.texplorer`、
   `%LOCALAPPDATA%` 等相对/平台路径。
 - 注释保持克制，只在逻辑不直观时添加。
