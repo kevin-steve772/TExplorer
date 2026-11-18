@@ -17,9 +17,14 @@
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <iterator>
+#include <mutex>
 #include <set>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -424,6 +429,19 @@ static bool samePath(const fs::path& a, const fs::path& b) {
     return pathEqual(normPath(a), normPath(b));
 }
 
+static bool samePathFast(const fs::path& a, const fs::path& b) {
+    std::error_code ec;
+    fs::path aa = fs::absolute(a, ec);
+    if (ec) {
+        ec.clear();
+        aa = a;
+    }
+    fs::path bb = fs::absolute(b, ec);
+    if (ec)
+        bb = b;
+    return pathEqual(aa.lexically_normal(), bb.lexically_normal());
+}
+
 static bool isSubPath(const fs::path& child, const fs::path& parent) {
     fs::path c = normPath(child);
     fs::path p = normPath(parent);
@@ -538,6 +556,198 @@ static bool movePath(const fs::path& src, const fs::path& dst, std::error_code& 
     return true;
 }
 
+static std::string uniqueNameInDir(const fs::path& dir, const std::string& base) {
+    std::error_code ec;
+    if (!fs::exists(plat::joinPath(dir, base), ec))
+        return base;
+    for (int i = 2; i < 10000; ++i) {
+        std::string n = base + " (" + std::to_string(i) + ")";
+        if (!fs::exists(plat::joinPath(dir, n), ec))
+            return n;
+    }
+    return base;
+}
+
+static std::string uniqueCopyNameInDir(const fs::path& dir,
+                                       const std::string& filename,
+                                       const std::string& suffix,
+                                       const std::set<std::string>* reserved = nullptr) {
+    auto available = [&](const std::string& name) {
+        std::error_code ec;
+        if (fs::exists(plat::joinPath(dir, name), ec))
+            return false;
+        if (reserved &&
+            reserved->count(plat::pathToUtf8(plat::joinPath(dir, name))))
+            return false;
+        return true;
+    };
+    fs::path fp = plat::pathFromUtf8(filename);
+    std::string stem = plat::pathToUtf8(fp.stem());
+    std::string ext = plat::pathToUtf8(fp.extension());
+    std::string base = stem + suffix + ext;
+    if (available(base))
+        return base;
+    for (int i = 2; i < 10000; ++i) {
+        std::string n = stem + suffix + " (" + std::to_string(i) + ")" + ext;
+        if (available(n))
+            return n;
+    }
+    return base;
+}
+
+static std::string uniqueTrashNameIn(const fs::path& files, const fs::path& info,
+                                     const std::string& filename) {
+    auto exists = [&](const std::string& n) {
+        std::error_code e;
+        return fs::exists(plat::joinPath(files, n), e) ||
+               fs::exists(plat::joinPath(info, n + ".trashinfo"), e);
+    };
+    if (!exists(filename))
+        return filename;
+    fs::path fp = plat::pathFromUtf8(filename);
+    std::string stem = plat::pathToUtf8(fp.stem());
+    std::string ext = plat::pathToUtf8(fp.extension());
+    if (stem.empty())
+        stem = filename;
+    for (int i = 2; i < 10000; ++i) {
+        std::string n = stem + " (" + std::to_string(i) + ")" + ext;
+        if (!exists(n))
+            return n;
+    }
+    return filename + "." + std::to_string((long)std::time(nullptr));
+}
+
+enum class TaskState { Running, Done, Failed };
+enum class TaskKind { Paste, MoveToTrash, PermanentDelete, Restore, EmptyTrash };
+
+struct TaskInfo {
+    int id = 0;
+    TaskKind kind = TaskKind::Paste;
+    std::string title;
+    TaskState state = TaskState::Running;
+    std::size_t total = 0;
+    std::size_t done = 0;
+    std::size_t skipped = 0;
+    std::size_t failed = 0;
+    std::string error;
+};
+
+class TaskManager {
+public:
+    int start(TaskKind kind, const std::string& title,
+              std::function<void(int)> work) {
+        int id = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            id = nextId_++;
+            TaskInfo info;
+            info.id = id;
+            info.kind = kind;
+            info.title = title;
+            tasks_.push_back(std::move(info));
+            running_++;
+        }
+        try {
+            workers_.emplace_back([this, id, work = std::move(work)]() mutable {
+                try {
+                    std::lock_guard<std::mutex> opLock(opMutex_);
+                    work(id);
+                } catch (const std::exception& e) {
+                    fail(id, e.what());
+                } catch (...) {
+                    fail(id, "unknown error");
+                }
+                finish(id);
+            });
+        } catch (const std::exception& e) {
+            fail(id, e.what());
+            finish(id);
+        }
+        return id;
+    }
+
+    std::vector<TaskInfo> snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return tasks_;
+    }
+
+    int runningCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return running_;
+    }
+
+    bool consumeRefresh() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bool refresh = refresh_;
+        refresh_ = false;
+        return refresh;
+    }
+
+    void setTotal(int id, std::size_t total) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (TaskInfo& t : tasks_) {
+            if (t.id == id) {
+                t.total = total;
+                break;
+            }
+        }
+    }
+
+    void update(int id, std::size_t done, std::size_t skipped,
+                std::size_t failed) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (TaskInfo& t : tasks_) {
+            if (t.id == id) {
+                t.done = done;
+                t.skipped = skipped;
+                t.failed = failed;
+                break;
+            }
+        }
+    }
+
+    void finish(int id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (TaskInfo& t : tasks_) {
+            if (t.id == id) {
+                if (t.state == TaskState::Running)
+                    t.state = TaskState::Done;
+                break;
+            }
+        }
+        if (running_ > 0)
+            running_--;
+        refresh_ = true;
+    }
+
+    void fail(int id, const std::string& error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (TaskInfo& t : tasks_) {
+            if (t.id == id) {
+                t.state = TaskState::Failed;
+                t.error = error;
+                break;
+            }
+        }
+    }
+
+    ~TaskManager() {
+        for (std::thread& t : workers_) {
+            if (t.joinable())
+                t.join();
+        }
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::mutex opMutex_;
+    std::vector<TaskInfo> tasks_;
+    std::vector<std::thread> workers_;
+    int nextId_ = 1;
+    int running_ = 0;
+    bool refresh_ = false;
+};
+
 static int dlgButtonW(const std::string& label) {
     return utf8Cols(label) + 4;
 }
@@ -553,6 +763,172 @@ static void drawDlgButton(WINDOW* win, int y, int x, const std::string& label,
         attr = attrHover | A_BOLD;
     wput(win, y, x, utf8Cols(s), s, attr);
 }
+
+struct Entry {
+    std::string name;
+    fs::path path;
+    bool isDir = false;
+    bool isLink = false;
+    uintmax_t size = 0;
+    std::time_t mtime = 0;
+    std::string type;
+};
+
+struct DirLoadResult {
+    std::uint64_t generation = 0;
+    fs::path path;
+    std::vector<Entry> entries;
+    std::error_code error;
+    std::string errorText;
+    bool notDirectory = false;
+    bool fallback = false;
+    bool freeOk = false;
+    uintmax_t freeBytes = 0;
+};
+
+static DirLoadResult loadDirectory(const fs::path& path, bool showHidden,
+                                   bool fallback) {
+    DirLoadResult result;
+    result.path = path;
+    try {
+        std::error_code ec;
+        if (!fs::is_directory(path, ec)) {
+            if (fallback) {
+                std::error_code ce;
+                fs::path cwd = fs::current_path(ce);
+                if (ce)
+                    cwd = plat::homeDir();
+                result.path = cwd;
+                result.fallback = true;
+                ec.clear();
+                if (!fs::is_directory(cwd, ec)) {
+                    result.notDirectory = true;
+                    result.error = ec;
+                    return result;
+                }
+            } else {
+                result.notDirectory = true;
+                result.error = ec;
+                return result;
+            }
+        }
+
+        fs::directory_iterator it(
+            result.path, fs::directory_options::skip_permission_denied, ec);
+        fs::directory_iterator end;
+        while (!ec && it != end) {
+            fs::path p = it->path();
+            std::string nm = plat::pathToUtf8(p.filename());
+            if (!nm.empty() && (showHidden || !plat::isHidden(p))) {
+                Entry e;
+                e.name = nm;
+                e.path = p;
+                std::error_code e2;
+                e.isDir = it->is_directory(e2);
+                e2.clear();
+                e.isLink = it->is_symlink(e2);
+                plat::FileMeta meta = plat::statFile(p);
+                if (meta.ok) {
+                    e.size = meta.size;
+                    e.mtime = meta.mtime;
+                }
+                result.entries.push_back(std::move(e));
+            }
+            it.increment(ec);
+        }
+        if (ec)
+            result.error = ec;
+
+        std::error_code se;
+        fs::space_info sp = fs::space(result.path, se);
+        result.freeOk = !se;
+        result.freeBytes = se ? 0 : sp.available;
+    } catch (const std::exception& e) {
+        result.errorText = e.what();
+    } catch (...) {
+        result.errorText = "unknown error";
+    }
+    return result;
+}
+
+class DirectoryLoader {
+public:
+    ~DirectoryLoader() {
+        for (Job& job : jobs_) {
+            if (!job.future.valid())
+                continue;
+            try {
+                job.future.get();
+            } catch (...) {
+            }
+        }
+    }
+
+    bool request(const fs::path& path, bool showHidden,
+                 std::uint64_t generation, bool fallback) {
+        try {
+            auto future = std::async(
+                std::launch::async,
+                [path, showHidden, fallback, generation]() {
+                    DirLoadResult result =
+                        loadDirectory(path, showHidden, fallback);
+                    result.generation = generation;
+                    return result;
+                });
+            jobs_.push_back(Job{generation, std::move(future)});
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool poll(DirLoadResult& out) {
+        bool found = false;
+        DirLoadResult best;
+        for (auto it = jobs_.begin(); it != jobs_.end();) {
+            if (it->future.wait_for(std::chrono::milliseconds(0)) !=
+                std::future_status::ready) {
+                ++it;
+                continue;
+            }
+            try {
+                DirLoadResult result = it->future.get();
+                if (!found || result.generation > best.generation) {
+                    best = std::move(result);
+                    found = true;
+                }
+            } catch (const std::exception& e) {
+                DirLoadResult result;
+                result.generation = it->generation;
+                result.errorText = e.what();
+                if (!found || result.generation > best.generation) {
+                    best = std::move(result);
+                    found = true;
+                }
+            } catch (...) {
+                DirLoadResult result;
+                result.generation = it->generation;
+                result.errorText = "unknown error";
+                if (!found || result.generation > best.generation) {
+                    best = std::move(result);
+                    found = true;
+                }
+            }
+            it = jobs_.erase(it);
+        }
+        if (found)
+            out = std::move(best);
+        return found;
+    }
+
+private:
+    struct Job {
+        std::uint64_t generation = 0;
+        std::future<DirLoadResult> future;
+    };
+
+    std::vector<Job> jobs_;
+};
 
 class App {
 public:
@@ -586,18 +962,9 @@ private:
         CMD_SORT_TYPE,
         CMD_SORT_SIZE,
         CMD_LANGUAGE,
+        CMD_TASKS,
         CMD_HELP,
         CMD_QUIT
-    };
-
-    struct Entry {
-        std::string name;
-        fs::path path;
-        bool isDir = false;
-        bool isLink = false;
-        uintmax_t size = 0;
-        std::time_t mtime = 0;
-        std::string type;
     };
 
     struct Rect {
@@ -657,12 +1024,32 @@ private:
     std::vector<fs::path> clipboard;
     bool clipboardCut = false;
     std::string statusMessage;
+    TaskManager taskManager;
+    DirectoryLoader dirLoader;
+    std::uint64_t dirGeneration = 0;
+    bool dirLoading = false;
+    std::string refreshKeepName;
+    std::string refreshKeepAnchor;
+    int refreshOldCursor = 0;
+    std::string pendingSelectName;
+    bool pendingRestoreOnFailure = false;
+    bool dirRestoreOnFailure = false;
+    fs::path dirPrevPath;
+    std::vector<fs::path> dirPrevHistory;
+    int dirPrevHistPos = 0;
+    int dirPrevCursor = 0;
+    int dirPrevScroll = 0;
+    int dirPrevAnchor = 0;
+    std::set<std::string> dirPrevSelected;
+    int spinnerFrame = 0;
+    std::set<int> notifiedTasks;
     uintmax_t freeBytes = 0;
     bool freeOk = false;
     chtype attrSel = A_REVERSE;
     chtype attrChrome = A_REVERSE;
     chtype attrHover = A_BOLD;
     chtype attrSelHover = A_REVERSE | A_BOLD;
+    chtype attrTask = A_BOLD;
     int mouseX = -1, mouseY = -1;
     bool mouseValid = false;
 
@@ -693,6 +1080,7 @@ private:
     int colTypeX = 0, colTypeW = 0;
     int colSizeX = 0, colSizeW = 0;
     Rect headerNameR, headerDateR, headerTypeR, headerSizeR;
+    Rect taskButtonRect;
     std::vector<Btn> toolbarButtons;
     std::vector<TabState> tabs;
     int activeTab = 0;
@@ -724,7 +1112,8 @@ private:
     void scrollToMouse(int y);
     void drawStatus();
 
-    void refresh();
+    void refresh(bool fallbackToCwd = false);
+    bool pollDirectory();
     void sortEntries();
     void applySort(SortKey k);
     void ensureVisible();
@@ -761,6 +1150,9 @@ private:
     void showProperties();
     void showHelp();
     void chooseLanguage();
+    void showTaskCenter();
+    bool pollTasks();
+    std::string taskLine(const TaskInfo& task) const;
 
     std::vector<fs::path> selectionPaths() const;
     std::string uniqueName(const fs::path& dir, const std::string& base) const;
@@ -799,10 +1191,12 @@ void App::run() {
             init_pair(2, 252, 236);
             init_pair(3, 255, 237);
             init_pair(4, 255, 240);
+            init_pair(5, 117, 236);
             attrSel = COLOR_PAIR(1);
             attrChrome = COLOR_PAIR(2);
             attrHover = COLOR_PAIR(3);
             attrSelHover = COLOR_PAIR(4);
+            attrTask = COLOR_PAIR(5) | A_BOLD;
         } else {
             init_pair(1, COLOR_WHITE, COLOR_BLACK);
             init_pair(2, COLOR_WHITE, COLOR_BLACK);
@@ -810,6 +1204,7 @@ void App::run() {
             attrChrome = COLOR_PAIR(2);
             attrHover = A_BOLD;
             attrSelHover = A_REVERSE | A_BOLD;
+            attrTask = A_BOLD;
         }
     } else {
         attrSel = A_REVERSE;
@@ -820,6 +1215,7 @@ void App::run() {
     mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, nullptr);
     mouseinterval(0);
     enableMouseMotion();
+    timeout(100);
 
     initState(startPath);
     tabs.push_back(snapshotTab());
@@ -830,17 +1226,30 @@ void App::run() {
     while (running) {
         wint_t wc = 0;
         int r = get_wch(&wc);
-        if (r == ERR)
+        if (r == ERR) {
+            bool dirty = false;
+            if (pollTasks())
+                dirty = true;
+            if (pollDirectory())
+                dirty = true;
+            if (dirty)
+                draw();
             continue;
+        }
         bool quit = false;
         if (r == KEY_CODE_YES)
             quit = processKey((int)wc);
         else
             quit = processChar(wc);
-        if (quit || shouldQuit)
+        if (quit || shouldQuit) {
             running = false;
-        else if (!skipDraw)
-            draw();
+        } else {
+            bool dirty = pollTasks();
+            if (pollDirectory())
+                dirty = true;
+            if (!skipDraw || dirty)
+                draw();
+        }
         skipDraw = false;
     }
     disableMouseMotion();
@@ -853,15 +1262,6 @@ void App::initState(const fs::path& start) {
     if (ec) {
         ec.clear();
         p = start;
-    }
-    fs::path c = fs::weakly_canonical(p, ec);
-    if (!ec)
-        p = c;
-    if (!fs::is_directory(p, ec)) {
-        ec.clear();
-        p = fs::current_path(ec);
-        if (ec)
-            p = plat::homeDir();
     }
     current = p;
     history.clear();
@@ -881,7 +1281,7 @@ void App::initState(const fs::path& start) {
     fs::create_directories(trashInfo, tec);
 
     rebuildQuickItems();
-    refresh();
+    refresh(true);
 }
 
 void App::rebuildQuickItems() {
@@ -940,11 +1340,17 @@ void App::computeLayout() {
     headerDateR = Rect{headerY, colDateX, 1, colDateW};
     headerTypeR = Rect{headerY, colTypeX, 1, colTypeW};
     headerSizeR = Rect{headerY, colSizeX, 1, colSizeW};
+
+    int taskW = utf8Cols(i18n::tr(i18n::Key::TaskCenter)) + 4;
+    taskW = std::max(0, std::min(taskW, COLS - 4));
+    taskButtonRect = Rect{statusY, 0, 1, taskW};
 }
 
 int App::hoverSignature(int x, int y) const {
     if (closeAppRect.contains(y, x))
         return 1;
+    if (taskButtonRect.contains(y, x))
+        return 90000;
     if (y == toolbarY) {
         for (const auto& b : tabCloseButtons)
             if (b.r.contains(y, x))
@@ -1046,6 +1452,7 @@ void App::loadTab(int idx) {
     sortKey = t.sortKey;
     sortAsc = t.sortAsc;
     entries.clear();
+    pendingSelectName.clear();
     searchActive = false;
     statusMessage.clear();
     refresh();
@@ -1298,7 +1705,7 @@ void App::drawSidebar() {
         if (y > contentBottom)
             break;
         const Quick& q = quickItems[i];
-        bool active = samePath(current, q.path);
+        bool active = samePathFast(current, q.path);
         Rect r{y, 0, 1, sidebarW};
         bool hov = mouseHover() && r.contains(mouseY, mouseX);
         chtype attr;
@@ -1361,7 +1768,8 @@ void App::drawList() {
         return;
 
     if (entries.empty()) {
-        std::string msg = i18n::tr(i18n::Key::EmptyFolder);
+        std::string msg = i18n::tr(dirLoading ? i18n::Key::LoadingDirectory
+                                             : i18n::Key::EmptyFolder);
         wput(stdscr, rowsTop, listX, listW, centerCols(msg, listW), A_DIM);
         return;
     }
@@ -1505,9 +1913,23 @@ void App::drawStatus() {
     if (rx > 1)
         wput(stdscr, statusY, rx, rw, right, attrChrome | A_DIM);
 
-    int lw = (rx > 1 ? rx - 2 : COLS - 2);
+    if (taskButtonRect.w > 0) {
+        static const char frames[] = "|/-\\";
+        int running = taskManager.runningCount();
+        std::string label = i18n::tr(i18n::Key::TaskCenter);
+        std::string text = running > 0
+                               ? std::string(1, frames[spinnerFrame % 4]) + " " + label
+                               : "  " + label;
+        bool hovered = mouseValid && taskButtonRect.contains(mouseY, mouseX);
+        chtype attr = hovered ? attrSelHover
+                              : (running > 0 ? attrTask : (attrChrome | A_DIM));
+        wput(stdscr, statusY, 0, taskButtonRect.w, text, attr);
+    }
+
+    int leftX = taskButtonRect.w + 1;
+    int lw = rx > leftX ? rx - leftX - 1 : 0;
     if (lw > 0)
-        wput(stdscr, statusY, 1, lw, left, attrChrome);
+        wput(stdscr, statusY, leftX, lw, left, attrChrome);
 }
 
 void App::sortEntries() {
@@ -1568,45 +1990,92 @@ void App::applySort(SortKey k) {
     ensureVisible();
 }
 
-void App::refresh() {
-    std::string keep;
+void App::refresh(bool fallbackToCwd) {
+    refreshKeepName.clear();
     if (cursor >= 0 && cursor < (int)entries.size())
-        keep = entries[cursor].name;
-    std::string keepAnchor;
+        refreshKeepName = entries[cursor].name;
+    refreshKeepAnchor.clear();
     if (anchor >= 0 && anchor < (int)entries.size())
-        keepAnchor = entries[anchor].name;
-    int oldCursor = cursor;
+        refreshKeepAnchor = entries[anchor].name;
+    refreshOldCursor = cursor;
+    dirRestoreOnFailure = pendingRestoreOnFailure;
+    pendingRestoreOnFailure = false;
 
-    entries.clear();
-    std::error_code ec;
-    fs::directory_iterator it(current, fs::directory_options::skip_permission_denied, ec);
-    fs::directory_iterator end;
-    while (!ec && it != end) {
-        fs::path p = it->path();
-        std::string nm = plat::pathToUtf8(p.filename());
-        if (!nm.empty() && (showHidden || !plat::isHidden(p))) {
-            Entry e;
-            e.name = nm;
-            e.path = p;
-            std::error_code e2;
-            e.isDir = it->is_directory(e2);
-            e2.clear();
-            e.isLink = it->is_symlink(e2);
-            plat::FileMeta meta = plat::statFile(p);
-            if (meta.ok) {
-                e.size = meta.size;
-                e.mtime = meta.mtime;
-            }
-            e.type = typeFor(p, e.isDir, e.isLink);
-            entries.push_back(std::move(e));
-        }
-        it.increment(ec);
-    }
-    if (ec)
+    dirGeneration++;
+    dirLoading = true;
+    if (!dirLoader.request(current, showHidden, dirGeneration, fallbackToCwd)) {
+        dirLoading = false;
         statusMessage = i18n::tf(i18n::Key::ReadDirFailed,
-                                 sanitize(ec.message()).c_str());
+                                 i18n::tr(i18n::Key::Unknown).c_str());
+    }
+}
 
+bool App::pollDirectory() {
+    DirLoadResult result;
+    if (!dirLoader.poll(result))
+        return false;
+    if (result.generation != dirGeneration)
+        return false;
+
+    dirLoading = false;
+    bool restoreOnFailure = dirRestoreOnFailure;
+    dirRestoreOnFailure = false;
+
+    if (result.fallback) {
+        current = result.path;
+        if (history.empty()) {
+            history.push_back(current);
+            histPos = 0;
+        } else if (histPos >= 0 && histPos < (int)history.size()) {
+            history[histPos] = current;
+        }
+        if (!tabs.empty() && activeTab >= 0 && activeTab < (int)tabs.size()) {
+            tabs[activeTab].current = current;
+            tabs[activeTab].history = history;
+            tabs[activeTab].histPos = histPos;
+        }
+    }
+
+    if (result.notDirectory) {
+        if (restoreOnFailure) {
+            current = dirPrevPath;
+            history = dirPrevHistory;
+            histPos = dirPrevHistPos;
+            cursor = dirPrevCursor;
+            scroll = dirPrevScroll;
+            anchor = dirPrevAnchor;
+            selected = dirPrevSelected;
+        } else {
+            entries.clear();
+            selected.clear();
+            cursor = 0;
+            scroll = 0;
+            anchor = 0;
+            freeOk = false;
+            freeBytes = 0;
+        }
+        pendingSelectName.clear();
+        statusMessage = i18n::tf(
+            i18n::Key::CannotOpen,
+            sanitize(plat::pathToUtf8(result.path)).c_str());
+        return true;
+    }
+
+    if (result.error || !result.errorText.empty()) {
+        std::string msg = result.errorText;
+        if (msg.empty() && result.error)
+            msg = result.error.message();
+        statusMessage = i18n::tf(i18n::Key::ReadDirFailed,
+                                 sanitize(msg).c_str());
+    }
+
+    entries = std::move(result.entries);
+    for (Entry& e : entries)
+        e.type = typeFor(e.path, e.isDir, e.isLink);
     sortEntries();
+
+    freeOk = result.freeOk;
+    freeBytes = result.freeBytes;
 
     std::set<std::string> names;
     for (const auto& e : entries)
@@ -1625,9 +2094,9 @@ void App::refresh() {
         selected.clear();
     } else {
         int idx = -1;
-        if (!keep.empty()) {
+        if (!refreshKeepName.empty()) {
             for (size_t i = 0; i < entries.size(); ++i) {
-                if (entries[i].name == keep) {
+                if (entries[i].name == refreshKeepName) {
                     idx = (int)i;
                     break;
                 }
@@ -1636,11 +2105,12 @@ void App::refresh() {
         if (idx >= 0)
             cursor = idx;
         else
-            cursor = std::clamp(oldCursor, 0, (int)entries.size() - 1);
+            cursor = std::clamp(refreshOldCursor, 0, (int)entries.size() - 1);
+
         bool anchorFound = false;
-        if (!keepAnchor.empty()) {
+        if (!refreshKeepAnchor.empty()) {
             for (size_t i = 0; i < entries.size(); ++i) {
-                if (entries[i].name == keepAnchor) {
+                if (entries[i].name == refreshKeepAnchor) {
                     anchor = (int)i;
                     anchorFound = true;
                     break;
@@ -1653,12 +2123,18 @@ void App::refresh() {
             selected.insert(entries[cursor].name);
     }
 
-    std::error_code se;
-    fs::space_info sp = fs::space(current, se);
-    freeOk = !se;
-    freeBytes = se ? 0 : sp.available;
+    if (!pendingSelectName.empty()) {
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (entries[i].name == pendingSelectName) {
+                selectOnly((int)i);
+                break;
+            }
+        }
+        pendingSelectName.clear();
+    }
 
     ensureVisible();
+    return true;
 }
 
 void App::ensureVisible() {
@@ -1677,23 +2153,24 @@ void App::ensureVisible() {
 
 void App::navigate(const fs::path& p, bool addHistory) {
     std::error_code ec;
-    if (!fs::is_directory(p, ec)) {
-        statusMessage = i18n::tf(i18n::Key::CannotOpen,
-                                 sanitize(plat::pathToUtf8(p)).c_str());
-        return;
-    }
     fs::path abs = fs::absolute(p, ec);
     if (ec) {
         ec.clear();
         abs = p;
     }
-    fs::path canon = fs::weakly_canonical(abs, ec);
-    if (!ec)
-        abs = canon;
 
     if (addHistory && !history.empty() && abs == history[histPos])
         return;
 
+    dirPrevPath = current;
+    dirPrevHistory = history;
+    dirPrevHistPos = histPos;
+    dirPrevCursor = cursor;
+    dirPrevScroll = scroll;
+    dirPrevAnchor = anchor;
+    dirPrevSelected = selected;
+    pendingRestoreOnFailure = true;
+    pendingSelectName.clear();
     current = abs;
     if (addHistory) {
         history.resize((size_t)histPos + 1);
@@ -1717,6 +2194,7 @@ void App::goBack() {
         cursor = 0;
         scroll = 0;
         anchor = 0;
+        pendingSelectName.clear();
         searchActive = false;
         statusMessage.clear();
         refresh();
@@ -1731,6 +2209,7 @@ void App::goForward() {
         cursor = 0;
         scroll = 0;
         anchor = 0;
+        pendingSelectName.clear();
         searchActive = false;
         statusMessage.clear();
         refresh();
@@ -1852,110 +2331,96 @@ void App::openExternal(const fs::path& p) {
 }
 
 bool App::inTrash() const {
-    return !trashFiles.empty() && samePath(current, trashFiles);
+    return !trashFiles.empty() && samePathFast(current, trashFiles);
 }
 
 std::string App::displayName(const fs::path& p) const {
-    if (!trashFiles.empty() && samePath(p, trashFiles))
+    if (!trashFiles.empty() && samePathFast(p, trashFiles))
         return i18n::tr(i18n::Key::Trash);
     std::string name = plat::pathToUtf8(p.filename());
     return name.empty() ? plat::rootLabel(p) : name;
 }
 
 std::string App::uniqueTrashName(const std::string& filename) const {
-    auto exists = [&](const std::string& n) {
-        std::error_code e;
-        return fs::exists(plat::joinPath(trashFiles, n), e) ||
-               fs::exists(plat::joinPath(trashInfo, n + ".trashinfo"), e);
-    };
-    if (!exists(filename))
-        return filename;
-    fs::path fp = plat::pathFromUtf8(filename);
-    std::string stem = plat::pathToUtf8(fp.stem());
-    std::string ext = plat::pathToUtf8(fp.extension());
-    if (stem.empty())
-        stem = filename;
-    for (int i = 2; i < 10000; ++i) {
-        std::string n = stem + " (" + std::to_string(i) + ")" + ext;
-        if (!exists(n))
-            return n;
-    }
-    return filename + "." + std::to_string((long)std::time(nullptr));
+    return uniqueTrashNameIn(trashFiles, trashInfo, filename);
 }
 
 void App::moveToTrash(const std::vector<fs::path>& items) {
-    std::error_code ec;
-    fs::create_directories(trashFiles, ec);
-    ec.clear();
-    fs::create_directories(trashInfo, ec);
+    if (items.empty())
+        return;
+    fs::path files = trashFiles;
+    fs::path info = trashInfo;
+    std::string title = i18n::tr(i18n::Key::MoveToTrashTitle);
+    TaskManager* tm = &taskManager;
+    tm->start(TaskKind::MoveToTrash, title,
+              [tm, items, files, info](int id) {
+        std::error_code ec;
+        fs::create_directories(files, ec);
+        ec.clear();
+        fs::create_directories(info, ec);
+        tm->setTotal(id, items.size());
+        std::size_t done = 0, failed = 0;
+        for (const fs::path& src : items) {
+            std::error_code e;
+            if (!fs::exists(src, e)) {
+                failed++;
+                tm->update(id, done, 0, failed);
+                continue;
+            }
+            fs::path original = src;
+            std::error_code ae;
+            fs::path abs = fs::absolute(src, ae);
+            if (!ae)
+                original = abs;
 
-    int ok = 0, fail = 0;
-    for (const fs::path& src : items) {
-        std::error_code e;
-        if (!fs::exists(src, e)) {
-            fail++;
-            continue;
+            std::string name = uniqueTrashNameIn(files, info,
+                                                 plat::pathToUtf8(src.filename()));
+            fs::path dst = plat::joinPath(files, name);
+            if (!movePath(src, dst, e)) {
+                failed++;
+                tm->update(id, done, 0, failed);
+                continue;
+            }
+            fs::path infoPath = plat::joinPath(info, name + ".trashinfo");
+            if (!writeTrashInfo(infoPath, original)) {
+                std::error_code e2;
+                movePath(dst, src, e2);
+                fs::remove(infoPath, e2);
+                failed++;
+            } else {
+                done++;
+            }
+            tm->update(id, done, 0, failed);
         }
-        fs::path original = src;
-        std::error_code ae;
-        fs::path abs = fs::absolute(src, ae);
-        if (!ae)
-            original = abs;
-
-        std::string name = uniqueTrashName(plat::pathToUtf8(src.filename()));
-        fs::path dst = plat::joinPath(trashFiles, name);
-        if (!movePath(src, dst, e)) {
-            fail++;
-            continue;
-        }
-        fs::path info = plat::joinPath(trashInfo, name + ".trashinfo");
-        if (!writeTrashInfo(info, original)) {
-            std::error_code e2;
-            movePath(dst, src, e2);
-            fs::remove(info, e2);
-            fail++;
-            continue;
-        }
-        ok++;
-    }
-
-    refresh();
-    if (fail > 0) {
-        std::string msg = i18n::tf(i18n::Key::MovedToTrashInfo, (std::size_t)ok,
-                                   i18n::itemWord((std::size_t)ok).c_str(),
-                                   (std::size_t)fail);
-        infoDialog(i18n::tr(i18n::Key::Trash), {msg});
-    } else {
-        setStatus(i18n::tf(i18n::Key::MoveToTrashDone, (std::size_t)ok,
-                           i18n::itemWord((std::size_t)ok).c_str()));
-    }
+    });
+    setStatus(i18n::tf(i18n::Key::TaskStarted, title.c_str()));
 }
 
 void App::trashDeleteSelection(const std::vector<fs::path>& items) {
-    int ok = 0, fail = 0;
-    for (const fs::path& p : items) {
-        std::error_code ec;
-        fs::remove_all(p, ec);
-        if (ec) {
-            fail++;
-            continue;
+    if (items.empty())
+        return;
+    fs::path info = trashInfo;
+    std::string title = i18n::tr(i18n::Key::PermanentDelete);
+    TaskManager* tm = &taskManager;
+    tm->start(TaskKind::PermanentDelete, title, [tm, items, info](int id) {
+        tm->setTotal(id, items.size());
+        std::size_t done = 0, failed = 0;
+        for (const fs::path& p : items) {
+            std::error_code ec;
+            fs::remove_all(p, ec);
+            if (ec) {
+                failed++;
+            } else {
+                std::error_code e2;
+                fs::remove(plat::joinPath(info,
+                                          plat::pathToUtf8(p.filename()) + ".trashinfo"),
+                           e2);
+                done++;
+            }
+            tm->update(id, done, 0, failed);
         }
-        std::error_code e2;
-        fs::remove(plat::joinPath(trashInfo,
-                                  plat::pathToUtf8(p.filename()) + ".trashinfo"),
-                   e2);
-        ok++;
-    }
-    refresh();
-    if (fail > 0) {
-        std::string msg = i18n::tf(i18n::Key::PermanentDeleteInfo, (std::size_t)ok,
-                                   i18n::itemWord((std::size_t)ok).c_str(),
-                                   (std::size_t)fail);
-        infoDialog(i18n::tr(i18n::Key::PermanentDelete), {msg});
-    } else {
-        setStatus(i18n::tf(i18n::Key::PermanentDeleteDone, (std::size_t)ok,
-                           i18n::itemWord((std::size_t)ok).c_str()));
-    }
+    });
+    setStatus(i18n::tf(i18n::Key::TaskStarted, title.c_str()));
 }
 
 void App::restoreSelection() {
@@ -1967,53 +2432,55 @@ void App::restoreSelection() {
         return;
     }
 
-    int ok = 0, fail = 0;
-    for (const fs::path& src : items) {
-        std::string name = plat::pathToUtf8(src.filename());
-        fs::path info = plat::joinPath(trashInfo, name + ".trashinfo");
-        fs::path original;
-        if (!readTrashInfo(info, original)) {
-            fail++;
-            continue;
+    fs::path infoDir = trashInfo;
+    fs::path home = plat::homeDir();
+    std::string title = i18n::tr(i18n::Key::Restore);
+    TaskManager* tm = &taskManager;
+    tm->start(TaskKind::Restore, title, [tm, items, infoDir, home](int id) {
+        tm->setTotal(id, items.size());
+        std::size_t done = 0, failed = 0;
+        for (const fs::path& src : items) {
+            std::string name = plat::pathToUtf8(src.filename());
+            fs::path info = plat::joinPath(infoDir, name + ".trashinfo");
+            fs::path original;
+            if (!readTrashInfo(info, original)) {
+                failed++;
+                tm->update(id, done, 0, failed);
+                continue;
+            }
+
+            std::error_code ec;
+            fs::path parent = original.parent_path();
+            if (parent.empty())
+                parent = original.root_path();
+            if (parent.empty())
+                parent = home;
+            fs::create_directories(parent, ec);
+            if (ec) {
+                failed++;
+                tm->update(id, done, 0, failed);
+                continue;
+            }
+
+            fs::path dst = original;
+            if (fs::exists(dst, ec))
+                dst = plat::joinPath(
+                    parent,
+                    uniqueNameInDir(parent, plat::pathToUtf8(original.filename())));
+
+            ec.clear();
+            if (!movePath(src, dst, ec)) {
+                failed++;
+                tm->update(id, done, 0, failed);
+                continue;
+            }
+            std::error_code e2;
+            fs::remove(info, e2);
+            done++;
+            tm->update(id, done, 0, failed);
         }
-
-        std::error_code ec;
-        fs::path parent = original.parent_path();
-        if (parent.empty())
-            parent = original.root_path();
-        if (parent.empty())
-            parent = plat::homeDir();
-        fs::create_directories(parent, ec);
-        if (ec) {
-            fail++;
-            continue;
-        }
-
-        fs::path dst = original;
-        if (fs::exists(dst, ec))
-            dst = plat::joinPath(
-                parent, uniqueName(parent, plat::pathToUtf8(original.filename())));
-
-        ec.clear();
-        if (!movePath(src, dst, ec)) {
-            fail++;
-            continue;
-        }
-        std::error_code e2;
-        fs::remove(info, e2);
-        ok++;
-    }
-
-    refresh();
-    if (fail > 0) {
-        std::string msg = i18n::tf(i18n::Key::RestoreInfo, (std::size_t)ok,
-                                   i18n::itemWord((std::size_t)ok).c_str(),
-                                   (std::size_t)fail);
-        infoDialog(i18n::tr(i18n::Key::Restore), {msg});
-    } else {
-        setStatus(i18n::tf(i18n::Key::RestoreDone, (std::size_t)ok,
-                           i18n::itemWord((std::size_t)ok).c_str()));
-    }
+    });
+    setStatus(i18n::tf(i18n::Key::TaskStarted, title.c_str()));
 }
 
 void App::emptyTrash() {
@@ -2023,28 +2490,32 @@ void App::emptyTrash() {
                        i18n::tr(i18n::Key::EmptyTrashConfirm)))
         return;
 
-    int fail = 0;
-    auto clearDir = [&](const fs::path& dir) {
-        std::error_code ec;
-        fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
-        while (!ec && it != end) {
-            std::error_code e;
-            fs::remove_all(it->path(), e);
-            if (e)
-                fail++;
-            it.increment(ec);
-        }
-    };
-    clearDir(trashFiles);
-    clearDir(trashInfo);
-
-    refresh();
-    if (fail > 0)
-        infoDialog(i18n::tr(i18n::Key::EmptyTrash),
-                   {i18n::tf(i18n::Key::EmptyTrashFail, (std::size_t)fail,
-                             i18n::itemWord((std::size_t)fail).c_str())});
-    else
-        setStatus(i18n::tr(i18n::Key::TrashEmptied));
+    fs::path files = trashFiles;
+    fs::path info = trashInfo;
+    std::string title = i18n::tr(i18n::Key::EmptyTrash);
+    TaskManager* tm = &taskManager;
+    tm->start(TaskKind::EmptyTrash, title, [tm, files, info](int id) {
+        std::size_t done = 0, failed = 0;
+        auto clearDir = [&](const fs::path& dir) {
+            std::error_code ec;
+            fs::directory_iterator it(dir,
+                                     fs::directory_options::skip_permission_denied,
+                                     ec), end;
+            while (!ec && it != end) {
+                std::error_code e;
+                fs::remove_all(it->path(), e);
+                if (e)
+                    failed++;
+                else
+                    done++;
+                it.increment(ec);
+                tm->update(id, done, 0, failed);
+            }
+        };
+        clearDir(files);
+        clearDir(info);
+    });
+    setStatus(i18n::tf(i18n::Key::TaskStarted, title.c_str()));
 }
 
 void App::copySel(bool cut) {
@@ -2065,32 +2536,11 @@ void App::copySel(bool cut) {
 }
 
 std::string App::uniqueName(const fs::path& dir, const std::string& base) const {
-    std::error_code ec;
-    if (!fs::exists(plat::joinPath(dir, base), ec))
-        return base;
-    for (int i = 2; i < 10000; ++i) {
-        std::string n = base + " (" + std::to_string(i) + ")";
-        if (!fs::exists(plat::joinPath(dir, n), ec))
-            return n;
-    }
-    return base;
+    return uniqueNameInDir(dir, base);
 }
 
 std::string App::uniqueCopyName(const fs::path& dir, const std::string& filename) const {
-    fs::path fp = plat::pathFromUtf8(filename);
-    std::string stem = plat::pathToUtf8(fp.stem());
-    std::string ext = plat::pathToUtf8(fp.extension());
-    std::string base = stem + i18n::tr(i18n::Key::CopySuffix) + ext;
-    std::error_code ec;
-    if (!fs::exists(plat::joinPath(dir, base), ec))
-        return base;
-    for (int i = 2; i < 10000; ++i) {
-        std::string n = stem + i18n::tr(i18n::Key::CopySuffix) +
-                        " (" + std::to_string(i) + ")" + ext;
-        if (!fs::exists(plat::joinPath(dir, n), ec))
-            return n;
-    }
-    return base;
+    return uniqueCopyNameInDir(dir, filename, i18n::tr(i18n::Key::CopySuffix));
 }
 
 void App::paste() {
@@ -2102,8 +2552,19 @@ void App::paste() {
         setStatus(i18n::tr(i18n::Key::ClipboardEmpty));
         return;
     }
+
+    struct PastePlan {
+        fs::path src;
+        fs::path dst;
+        bool replace = false;
+    };
+
     fs::path target = current;
-    int done = 0, skipped = 0, failed = 0;
+    bool cut = clipboardCut;
+    std::string copySuffix = i18n::tr(i18n::Key::CopySuffix);
+    std::vector<PastePlan> plan;
+    std::set<std::string> reserved;
+    std::size_t skipped = 0, failed = 0;
 
     for (const fs::path& src : clipboard) {
         std::error_code ec;
@@ -2113,7 +2574,7 @@ void App::paste() {
         }
         fs::path dst = target / src.filename();
 
-        if (clipboardCut && samePath(src.parent_path(), target)) {
+        if (cut && samePath(src.parent_path(), target)) {
             skipped++;
             continue;
         }
@@ -2121,9 +2582,13 @@ void App::paste() {
             failed++;
             continue;
         }
-        if (samePath(src, dst)) {
+
+        bool replace = false;
+        if (samePath(src, dst) || reserved.count(plat::pathToUtf8(dst))) {
             dst = plat::joinPath(
-                target, uniqueCopyName(target, plat::pathToUtf8(src.filename())));
+                target,
+                uniqueCopyNameInDir(target, plat::pathToUtf8(src.filename()),
+                                    copySuffix, &reserved));
         } else if (fs::exists(dst, ec)) {
             std::string msg = i18n::tf(
                 i18n::Key::ReplaceConfirm,
@@ -2132,52 +2597,83 @@ void App::paste() {
                 skipped++;
                 continue;
             }
-            fs::remove_all(dst, ec);
-            if (ec) {
-                failed++;
-                continue;
-            }
+            replace = true;
         }
+        reserved.insert(plat::pathToUtf8(dst));
+        plan.push_back({src, dst, replace});
+    }
 
-        ec.clear();
-        if (clipboardCut) {
-            fs::rename(src, dst, ec);
-            if (ec) {
-                ec.clear();
-                fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::copy_symlinks, ec);
-                if (!ec) {
-                    std::error_code e2;
-                    fs::remove_all(src, e2);
-                    if (e2)
-                        ec = e2;
+    if (plan.empty()) {
+        if (cut)
+            clipboard.clear();
+        refresh();
+        if (failed > 0) {
+            infoDialog(i18n::tr(i18n::Key::Paste),
+                       {i18n::tr(i18n::Key::PasteCompleted),
+                        i18n::tf(i18n::Key::SuccessCount, (std::size_t)0),
+                        i18n::tf(i18n::Key::SkippedCount, skipped),
+                        i18n::tf(i18n::Key::FailedCount, failed)});
+        } else {
+            std::string msg = i18n::tf(i18n::Key::PasteDoneStatus,
+                                       (std::size_t)0,
+                                       i18n::itemWord(0).c_str());
+            if (skipped > 0)
+                msg += i18n::tf(i18n::Key::PasteSkipped, skipped);
+            setStatus(msg);
+        }
+        return;
+    }
+
+    std::string title = i18n::tr(i18n::Key::Paste);
+    TaskManager* tm = &taskManager;
+    tm->start(TaskKind::Paste, title,
+              [tm, plan, cut, skipped, failed](int id) {
+        tm->setTotal(id, plan.size());
+        std::size_t done = 0, skip = skipped, fail = failed;
+        for (const PastePlan& item : plan) {
+            std::error_code ec;
+            if (item.replace) {
+                fs::remove_all(item.dst, ec);
+                if (ec) {
+                    fail++;
+                    tm->update(id, done, skip, fail);
+                    continue;
                 }
             }
-        } else {
-            fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::copy_symlinks, ec);
+
+            ec.clear();
+            if (cut) {
+                fs::rename(item.src, item.dst, ec);
+                if (ec) {
+                    ec.clear();
+                    fs::copy(item.src, item.dst,
+                             fs::copy_options::recursive |
+                                 fs::copy_options::copy_symlinks,
+                             ec);
+                    if (!ec) {
+                        std::error_code e2;
+                        fs::remove_all(item.src, e2);
+                        if (e2)
+                            ec = e2;
+                    }
+                }
+            } else {
+                fs::copy(item.src, item.dst,
+                         fs::copy_options::recursive |
+                             fs::copy_options::copy_symlinks,
+                         ec);
+            }
+            if (ec)
+                fail++;
+            else
+                done++;
+            tm->update(id, done, skip, fail);
         }
-        if (ec)
-            failed++;
-        else
-            done++;
-    }
+    });
 
-    if (clipboardCut)
+    if (cut)
         clipboard.clear();
-
-    refresh();
-    if (failed > 0) {
-        infoDialog(i18n::tr(i18n::Key::Paste),
-                   {i18n::tr(i18n::Key::PasteCompleted),
-                    i18n::tf(i18n::Key::SuccessCount, (std::size_t)done),
-                    i18n::tf(i18n::Key::SkippedCount, (std::size_t)skipped),
-                    i18n::tf(i18n::Key::FailedCount, (std::size_t)failed)});
-    } else {
-        std::string msg = i18n::tf(i18n::Key::PasteDoneStatus, (std::size_t)done,
-                                   i18n::itemWord((std::size_t)done).c_str());
-        if (skipped > 0)
-            msg += i18n::tf(i18n::Key::PasteSkipped, (std::size_t)skipped);
-        setStatus(msg);
-    }
+    setStatus(i18n::tf(i18n::Key::TaskStarted, title.c_str()));
 }
 
 void App::deleteSelection() {
@@ -2230,13 +2726,8 @@ void App::newFolder() {
                              sanitize(ec.message()).c_str())});
         return;
     }
+    pendingSelectName = name;
     refresh();
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].name == name) {
-            selectOnly((int)i);
-            break;
-        }
-    }
     setStatus(i18n::tf(i18n::Key::CreatedFolder, sanitize(name).c_str()));
 }
 
@@ -2273,13 +2764,8 @@ void App::renameCurrent() {
                              sanitize(ec.message()).c_str())});
         return;
     }
+    pendingSelectName = name;
     refresh();
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].name == name) {
-            selectOnly((int)i);
-            break;
-        }
-    }
     setStatus(i18n::tf(i18n::Key::Renamed, sanitize(name).c_str()));
 }
 
@@ -2341,6 +2827,195 @@ void App::chooseLanguage() {
         setStatus(i18n::tr(i18n::Key::LanguageChanged));
     else
         setStatus(i18n::tr(i18n::Key::ConfigSaveFailed));
+}
+
+std::string App::taskLine(const TaskInfo& task) const {
+    static const char frames[] = "|/-\\";
+    std::string prefix;
+    if (task.state == TaskState::Running)
+        prefix = std::string(1, frames[spinnerFrame % 4]) + " ";
+    else if (task.state == TaskState::Failed || task.failed > 0)
+        prefix = "! ";
+    else
+        prefix = "✓ ";
+
+    std::string line = prefix + sanitize(task.title);
+    if (task.total > 0)
+        line += " " + i18n::tf(i18n::Key::TaskProgress, task.done, task.total);
+
+    if (task.state == TaskState::Running) {
+        line += " " + i18n::tr(i18n::Key::TaskRunning);
+    } else if (task.state == TaskState::Failed) {
+        line += " " + i18n::tr(i18n::Key::TaskFailed);
+        if (!task.error.empty())
+            line += " (" + sanitize(task.error) + ")";
+    } else if (task.failed > 0) {
+        line += " " + i18n::tr(i18n::Key::TaskWithErrors);
+        line += " (" + i18n::tf(i18n::Key::TaskSummary, task.done,
+                                task.skipped, task.failed) + ")";
+    } else if (task.skipped > 0) {
+        line += " " + i18n::tf(i18n::Key::TaskSummary, task.done,
+                               task.skipped, task.failed);
+    } else {
+        line += " " + i18n::tr(i18n::Key::TaskDone);
+    }
+    return line;
+}
+
+bool App::pollTasks() {
+    int running = taskManager.runningCount();
+    bool dirty = false;
+    if (running > 0) {
+        spinnerFrame = (spinnerFrame + 1) % 4;
+        dirty = true;
+    }
+
+    std::vector<TaskInfo> tasks = taskManager.snapshot();
+    std::vector<std::string> completed;
+    bool refreshNeeded = false;
+    for (const TaskInfo& task : tasks) {
+        if (task.state == TaskState::Running || notifiedTasks.count(task.id))
+            continue;
+        notifiedTasks.insert(task.id);
+        refreshNeeded = true;
+        if (task.state == TaskState::Failed) {
+            completed.push_back(
+                i18n::tf(i18n::Key::TaskFailedStatus, task.title.c_str()));
+        } else if (task.failed > 0) {
+            std::string msg =
+                i18n::tf(i18n::Key::TaskFinished, task.title.c_str());
+            msg += " ";
+            msg += i18n::tf(i18n::Key::TaskSummary, task.done,
+                            task.skipped, task.failed);
+            completed.push_back(msg);
+        } else {
+            completed.push_back(
+                i18n::tf(i18n::Key::TaskFinished, task.title.c_str()));
+        }
+    }
+
+    if (refreshNeeded)
+        refresh();
+    if (!completed.empty()) {
+        setStatus(completed.back());
+        dirty = true;
+    }
+    if (taskManager.consumeRefresh())
+        dirty = true;
+    return dirty;
+}
+
+void App::showTaskCenter() {
+    if (COLS < 40 || LINES < 10) {
+        setStatus(i18n::tr(i18n::Key::TaskCenter));
+        return;
+    }
+
+    draw();
+    int w = std::min(COLS - 4, std::max(48, COLS * 3 / 4));
+    int h = std::max(8, std::min(16, LINES - 4));
+    int y = (LINES - h) / 2;
+    int x = (COLS - w) / 2;
+    WINDOW* win = newwin(h, w, y, x);
+    if (!win)
+        return;
+    keypad(win, TRUE);
+    wtimeout(win, 100);
+
+    std::string closeLabel = i18n::tr(i18n::Key::Close);
+    int bw = dlgButtonW(closeLabel);
+    int bx = std::max(2, (w - bw) / 2);
+    int by = h - 2;
+    int scroll = 0;
+    bool close = false;
+    bool hoverClose = false;
+
+    while (!close) {
+        std::vector<TaskInfo> tasks = taskManager.snapshot();
+        int listY = 2;
+        int listH = h - 4;
+        int maxScroll = std::max(0, (int)tasks.size() - listH);
+        scroll = std::clamp(scroll, 0, maxScroll);
+
+        werase(win);
+        box(win, 0, 0);
+        wattron(win, A_BOLD);
+        mvwaddstr(win, 0, 2,
+                  (" " + i18n::tr(i18n::Key::TaskCenter) + " ").c_str());
+        wattroff(win, A_BOLD);
+
+        if (tasks.empty()) {
+            wput(win, listY, 2, w - 4,
+                 i18n::tr(i18n::Key::TasksEmpty), A_DIM);
+        } else {
+            for (int row = 0; row < listH; ++row) {
+                int idx = scroll + row;
+                if (idx >= (int)tasks.size())
+                    break;
+                const TaskInfo& task = tasks[(size_t)idx];
+                chtype attr = A_DIM;
+                if (task.state == TaskState::Running)
+                    attr = attrTask;
+                else if (task.state == TaskState::Failed || task.failed > 0)
+                    attr = A_BOLD;
+                wput(win, listY + row, 2, w - 4, taskLine(task), attr);
+            }
+        }
+
+        drawDlgButton(win, by, bx, closeLabel, true, hoverClose,
+                      attrHover, attrSelHover);
+        wrefresh(win);
+
+        wint_t wc = 0;
+        int r = wget_wch(win, &wc);
+        if (r == ERR) {
+            spinnerFrame = (spinnerFrame + 1) % 4;
+            continue;
+        }
+        if (r == KEY_CODE_YES) {
+            if (wc == KEY_MOUSE) {
+                MEVENT ev;
+                if (getmouse(&ev) == OK) {
+                    int ly = ev.y - y;
+                    int lx = ev.x - x;
+                    if (ev.bstate & REPORT_MOUSE_POSITION) {
+                        hoverClose = (ly == by && lx >= bx && lx < bx + bw);
+                    } else if (ev.bstate & (BUTTON1_PRESSED | BUTTON1_CLICKED |
+                                            BUTTON1_DOUBLE_CLICKED)) {
+                        if (ly == by && lx >= bx && lx < bx + bw)
+                            close = true;
+                    } else if (ev.bstate & (BUTTON4_PRESSED | BUTTON4_CLICKED)) {
+                        scroll--;
+                    } else if (ev.bstate & (BUTTON5_PRESSED | BUTTON5_CLICKED)) {
+                        scroll++;
+                    }
+                }
+            } else if (wc == KEY_UP) {
+                scroll--;
+            } else if (wc == KEY_DOWN) {
+                scroll++;
+            } else if (wc == KEY_PPAGE) {
+                scroll -= std::max(1, listH - 1);
+            } else if (wc == KEY_NPAGE) {
+                scroll += std::max(1, listH - 1);
+            } else if (wc == KEY_HOME) {
+                scroll = 0;
+            } else if (wc == KEY_END) {
+                scroll = maxScroll;
+            } else if (wc == KEY_ENTER) {
+                close = true;
+            } else if (wc == KEY_RESIZE) {
+                close = true;
+            }
+        } else {
+            if (wc == 27 || wc == '\n' || wc == '\r' || wc == 'q' ||
+                wc == 'Q')
+                close = true;
+        }
+    }
+
+    delwin(win);
+    pollTasks();
 }
 
 void App::handleMouse() {
@@ -2466,6 +3141,11 @@ void App::handleMouse() {
 
     if ((left || right) && closeAppRect.contains(y, x)) {
         shouldQuit = true;
+        return;
+    }
+
+    if (left && taskButtonRect.contains(y, x)) {
+        showTaskCenter();
         return;
     }
 
@@ -2645,6 +3325,9 @@ void App::executeCmd(Cmd cmd) {
     case CMD_LANGUAGE:
         chooseLanguage();
         break;
+    case CMD_TASKS:
+        showTaskCenter();
+        break;
     case CMD_HELP:
         showHelp();
         break;
@@ -2720,6 +3403,7 @@ void App::showActionMenu(int px, int py) {
     add(CMD_SORT_SIZE, sortLabel(i18n::Key::SortBySize, SortKey::Size), true);
     add(CMD_NONE, "", false, true);
     add(CMD_LANGUAGE, i18n::tr(i18n::Key::Language), true);
+    add(CMD_TASKS, i18n::tr(i18n::Key::TaskCenter), true);
     add(CMD_HELP, i18n::tr(i18n::Key::Help), true);
     add(CMD_QUIT, i18n::tr(i18n::Key::Quit), true);
     if (px < 0)

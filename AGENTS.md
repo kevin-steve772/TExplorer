@@ -5,7 +5,7 @@
 ## 项目概述
 
 TExplorer 是一个 C++17 终端文件管理器，界面和操作方式参考 Windows 资源管理器。
-支持目录浏览、标签页、面包屑导航、文件操作、回收站、鼠标操作、排序、隐藏文件、
+支持目录浏览、标签页、面包屑导航、文件操作、后台任务、回收站、鼠标操作、排序、隐藏文件、
 多语言界面、窄终端自适应布局，以及 Linux / macOS / Windows 平台。
 
 - Linux：ncursesw
@@ -80,17 +80,54 @@ where.exe ninja
 `App` 定义在 `src/main.cpp`，核心成员和方法：
 
 - 状态：`current`、`entries`、`selected`、`cursor`、`scroll`、`tabs`、`clipboard`。
+- 后台任务：`taskManager`、`spinnerFrame`、`notifiedTasks` 保存任务队列、旋转帧和已通知结果。
+- 目录读取：`dirLoader`、`dirGeneration`、`dirLoading` 保存异步读取器、结果代次和加载状态。
 - 标签页：`TabState` 保存每个标签的路径、历史、选择、光标、滚动位置和排序状态。
-- 布局：`computeLayout()` 计算工具栏、地址栏、表头、列表、侧边栏、状态栏的矩形。
+- 布局：`computeLayout()` 计算工具栏、地址栏、表头、列表、侧边栏、状态栏和任务中心按钮的矩形。
 - 绘制：`draw()` 调用 `drawTabs()`、`drawAddress()`、`drawSidebar()`、`drawList()`、
-  `drawScrollbar()`、`drawStatus()`。
-- 鼠标：`handleMouse()` 处理点击、双击、右键、滚轮、悬停和滚动条拖动。
+  `drawScrollbar()`、`drawStatus()`；`drawStatus()` 负责左下角任务中心按钮和旋转指示。
+- 鼠标：`handleMouse()` 处理点击、双击、右键、滚轮、悬停、滚动条拖动和任务中心按钮。
 - 键盘：`processKey()` 处理功能键，`processChar()` 处理普通字符和快捷键。
 - 操作：`navigate()`、`openCurrent()`、`copySel()`、`paste()`、`deleteSelection()`、
   `moveToTrash()`、`restoreSelection()` 等。
 - 对话框：`showDialog()`、`inputDialog()`、`popupMenu()`，各自是独立窗口和事件循环。
 - 多语言：`chooseLanguage()` 切换语言并写入 `config.json`，`rebuildQuickItems()`
   重建侧边栏；文本统一通过 `i18n::tr()` / `i18n::tf()` 获取。
+
+### 后台任务
+
+`TaskManager`、`TaskInfo`、`TaskKind`、`TaskState` 定义在 `src/main.cpp`：
+
+- 批量复制 / 剪切 / 粘贴、移入回收站、永久删除、还原和清空回收站在工作线程执行；
+  新建文件夹、重命名和属性查看保持同步。
+- 工作线程只捕获路径、标题和计数，通过 `TaskManager::setTotal()` / `update()` 回报进度；
+  不要在工作线程调用 `i18n` 或访问 `App` / curses 状态。
+- 粘贴冲突在 UI 线程预先确认，工作线程只执行已计算的计划。
+- `pollTasks()` 在 100ms 输入超时和每次输入后调用，推进旋转帧、刷新完成状态并在任务完成时刷新目录；
+  `pollDirectory()` 同时轮询目录读取结果。
+- 主循环使用 `timeout(100)`，保证任务和目录读取运行期间仍能响应输入和动画。
+- `showTaskCenter()` 是独立窗口事件循环，使用 `wtimeout(win, 100)` 实时刷新任务快照；
+  支持滚动、鼠标滚轮、关闭按钮和键盘导航。
+- `taskButtonRect` 由 `computeLayout()` 计算，`drawStatus()` 绘制；悬停签名使用 `90000`。
+- `TaskManager` 析构时会 join 所有工作线程，因此退出程序会等待后台任务结束。
+
+### 目录读取
+
+`Entry`、`DirLoadResult`、`DirectoryLoader` 和 `loadDirectory()` 定义在 `src/main.cpp`：
+
+- `DirectoryLoader` 为每次请求启动 `std::async(std::launch::async)`，通过
+  `dirGeneration` 丢弃过期结果；不要复用 `TaskManager` 执行目录读取。
+- 工作线程只捕获路径、`showHidden` 和 fallback 标志，返回 `DirLoadResult`；
+  不要在工作线程调用 `i18n`、`typeFor()` 或访问 `App` / curses 状态。
+- `typeFor()` 和 `sortEntries()` 在 UI 线程应用结果时执行；`pollDirectory()`
+  负责保留光标 / 选择、处理导航失败回退和启动路径 fallback。
+- `refresh()` 只发起请求；主循环在 100ms 超时和每次输入后同时调用
+  `pollTasks()` 与 `pollDirectory()`。`dirLoading` 为真时列表显示
+  `LoadingDirectory`。
+- 快速连续切换目录时，旧代次结果会被忽略；导航失败时恢复到上一个有效目录。
+- 不要在 UI 线程对网络路径执行 `fs::is_directory()` / `fs::weakly_canonical()`
+  等可能阻塞的操作；绘制期的路径比较使用 `samePathFast()`。
+- `DirectoryLoader` 析构时会 join 所有读取线程，因此退出程序会等待目录读取结束。
 
 ### 平台抽象
 
@@ -243,6 +280,11 @@ cmake --build build
    - `config.json` 的读取、首次创建、切换语言写回和不可写时的失败提示
    - 窄终端下的语言选择对话框
    - 回收站操作
+   - 后台粘贴、移入回收站、永久删除、还原和清空回收站
+   - 任务中心按钮的旋转指示、悬停、点击、实时进度和结果状态
+   - 后台任务运行期间键盘 / 鼠标仍可响应，任务完成后列表自动刷新
+   - 慢速目录读取期间界面仍可操作，列表显示加载提示，完成后显示最新结果
+   - 快速连续切换目录时只应用最新结果，旧结果不会覆盖当前目录
    - Linux 下 `nano` 打开/退出后的 TUI 恢复
    - Windows 下的路径、磁盘列表、默认程序打开（如环境可用）
 
@@ -299,6 +341,7 @@ set -g mouse on
 - 使用 C++17，保持现有代码风格。
 - 不引入新依赖，除非确有必要并说明原因。
 - 优先使用 `plat::` 抽象，不要把平台逻辑散落在 `main.cpp`。
+- 新增耗时文件操作时使用 `TaskManager` 后台执行，不要把批量操作放回 UI 线程。
 - 所有显示文本按 UTF-8 处理，使用已有的宽度计算工具。
 - 新增或修改用户可见文本时，必须同步更新 `src/i18n.cpp` 的四种语言。
 - 不要用设备相关的绝对路径写文档或示例；使用 `./build`、`~/.texplorer`、
