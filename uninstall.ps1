@@ -37,6 +37,11 @@ if (Test-Path -LiteralPath $InstallDir) {
 }
 
 if ($PurgeData) {
+    $config = Join-Path $InstallDir "config.json"
+    if (Test-Path -LiteralPath $config) {
+        Remove-Item -LiteralPath $config -Force
+        Write-Host "Removed TExplorer config: $config"
+    }
     $trash = Join-Path $env:LOCALAPPDATA "TExplorer\Trash"
     if (Test-Path -LiteralPath $trash) {
         Remove-Item -LiteralPath $trash -Recurse -Force

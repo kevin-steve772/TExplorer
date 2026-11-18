@@ -17,6 +17,7 @@
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -38,6 +39,52 @@ static const char* ICON_FILE = "📄";
 static const char* ICON_LINK = "🔗";
 static const char* ICON_TRASH = "🗑";
 #endif
+
+static fs::path configFilePath() {
+    return plat::executableDir() / "config.json";
+}
+
+static bool readConfigLanguage(const fs::path& path, i18n::Lang& lang) {
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec) || ec)
+        return false;
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return false;
+    std::string text;
+    try {
+        text.assign(std::istreambuf_iterator<char>(in),
+                    std::istreambuf_iterator<char>());
+    } catch (const std::exception&) {
+        return false;
+    }
+    std::size_t pos = 0;
+    while ((pos = text.find("\"language\"", pos)) != std::string::npos) {
+        std::size_t colon = text.find(':', pos + 10);
+        if (colon == std::string::npos)
+            return false;
+        std::size_t q1 = text.find('"', colon + 1);
+        if (q1 == std::string::npos)
+            return false;
+        std::size_t q2 = text.find('"', q1 + 1);
+        if (q2 == std::string::npos)
+            return false;
+        if (i18n::parseLanguage(text.substr(q1 + 1, q2 - q1 - 1), lang))
+            return true;
+        pos = q2 + 1;
+    }
+    return false;
+}
+
+static bool writeConfigLanguage(const fs::path& path, i18n::Lang lang) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return false;
+    out << "{\n  \"language\": \"" << i18n::languageCode(lang)
+        << "\"\n}\n";
+    out.close();
+    return !out.fail();
+}
 
 static std::string sanitize(const std::string& s) {
     std::string out;
@@ -2290,7 +2337,10 @@ void App::chooseLanguage() {
     i18n::setLanguage(static_cast<i18n::Lang>(choice));
     rebuildQuickItems();
     refresh();
-    setStatus(i18n::tr(i18n::Key::LanguageChanged));
+    if (writeConfigLanguage(configFilePath(), i18n::language()))
+        setStatus(i18n::tr(i18n::Key::LanguageChanged));
+    else
+        setStatus(i18n::tr(i18n::Key::ConfigSaveFailed));
 }
 
 void App::handleMouse() {
@@ -3298,7 +3348,16 @@ App::Cmd App::popupMenu(const std::vector<MenuItem>& items, int px, int py) {
 int main(int argc, char** argv) {
     plat::initConsole();
     std::vector<std::string> args = plat::commandLineArgs(argc, argv);
-    i18n::setLanguage(i18n::detectLanguage());
+    fs::path configPath = configFilePath();
+    i18n::Lang lang;
+    if (!i18n::detectLanguageOverride(lang)) {
+        i18n::Lang configLang;
+        if (readConfigLanguage(configPath, configLang))
+            lang = configLang;
+        else
+            lang = i18n::detectLanguage();
+    }
+    i18n::setLanguage(lang);
 
     fs::path start;
     bool haveStart = false;
@@ -3344,6 +3403,10 @@ int main(int argc, char** argv) {
     }
     if (!haveStart)
         start = fs::current_path();
+
+    std::error_code configEc;
+    if (!fs::exists(configPath, configEc) && !configEc)
+        writeConfigLanguage(configPath, i18n::language());
 
     try {
         App app(start);

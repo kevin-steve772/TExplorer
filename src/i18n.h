@@ -115,6 +115,7 @@ enum class Key {
     ShowHiddenStatus,
     HideHiddenStatus,
     LanguageChanged,
+    ConfigSaveFailed,
     NoRestore,
 
     MoveToTrashTitle,
@@ -196,8 +197,10 @@ enum class Key {
 void setLanguage(Lang lang);
 Lang language();
 const char* languageName(Lang lang);
+const char* languageCode(Lang lang);
 bool parseLanguage(const std::string& value, Lang& out);
-Lang detectLanguage();
+bool detectLanguageOverride(Lang& out);
+Lang detectLanguage(Lang fallback = Lang::SimplifiedChinese);
 
 const char* text(Key key);
 std::string tr(Key key);

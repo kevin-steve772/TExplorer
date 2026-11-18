@@ -37,6 +37,10 @@ extern "C" int PDC_wcwidth(const std::int32_t ucs);
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
 #endif
 
 namespace fs = std::filesystem;
@@ -139,6 +143,43 @@ fs::path pathFromUtf8(const std::string& s) {
 
 fs::path joinPath(const fs::path& dir, const std::string& utf8Name) {
     return dir / pathFromUtf8(utf8Name);
+}
+
+fs::path executableDir() {
+#ifdef _WIN32
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD n = GetModuleFileNameW(nullptr, &buf[0], (DWORD)buf.size());
+        if (n == 0)
+            return fs::current_path();
+        if (n < buf.size()) {
+            buf.resize(n);
+            return fs::path(buf).parent_path();
+        }
+        buf.resize(buf.size() * 2);
+    }
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    if (size > 0) {
+        std::vector<char> buf(size);
+        if (_NSGetExecutablePath(buf.data(), &size) == 0) {
+            std::error_code ec;
+            fs::path p = fs::weakly_canonical(fs::path(buf.data()), ec);
+            return (ec ? fs::path(buf.data()) : p).parent_path();
+        }
+    }
+    return fs::current_path();
+#else
+    std::error_code ec;
+    fs::path p = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec && !p.empty()) {
+        std::error_code cec;
+        fs::path c = fs::weakly_canonical(p, cec);
+        return (cec ? p : c).parent_path();
+    }
+    return fs::current_path();
+#endif
 }
 
 bool localTime(std::time_t t, std::tm& out) {

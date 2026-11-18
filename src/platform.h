@@ -19,6 +19,7 @@ std::string pathToUtf8(const std::filesystem::path& p);
 std::filesystem::path pathFromUtf8(const std::string& s);
 std::filesystem::path joinPath(const std::filesystem::path& dir,
                                const std::string& utf8Name);
+std::filesystem::path executableDir();
 
 bool localTime(std::time_t t, std::tm& out);
 int caseCmp(const char* a, const char* b);

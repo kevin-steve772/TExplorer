@@ -159,6 +159,10 @@ const Entry kEntries[] = {
     {Key::ShowHiddenStatus, {"Showing hidden items", "正在显示隐藏项目", "正在顯示隱藏項目", "已把 . 开头的秘密挖出来"}},
     {Key::HideHiddenStatus, {"Hiding hidden items", "正在隐藏隐藏项目", "正在隱藏隱藏項目", "已把 . 开头的秘密藏回去"}},
     {Key::LanguageChanged, {"Language changed", "语言已切换", "語言已切換", "语言切好了，不用重开终端"}},
+    {Key::ConfigSaveFailed, {"Language changed, but config could not be saved.",
+                             "语言已切换，但配置保存失败。",
+                             "語言已切換，但設定儲存失敗。",
+                             "语言切好了，但 config.json 没写进去（权限在挡你）。"}},
     {Key::NoRestore, {"Nothing to restore", "没有可还原的项目", "沒有可還原的項目", "空空如也的回收站"}},
 
     {Key::MoveToTrashTitle, {"Move to Trash", "移入回收站", "移入資源回收筒", "丢进黑洞"}},
@@ -385,6 +389,16 @@ const char* languageName(Lang lang) {
     return "English";
 }
 
+const char* languageCode(Lang lang) {
+    switch (lang) {
+    case Lang::English: return "en";
+    case Lang::SimplifiedChinese: return "zh";
+    case Lang::TraditionalChinese: return "zh_TW";
+    case Lang::MemeChinese: return "meme";
+    }
+    return "en";
+}
+
 bool parseLanguage(const std::string& value, Lang& out) {
     std::string v = lowerAscii(value);
     if (v.empty()) return false;
@@ -419,18 +433,21 @@ bool parseLanguage(const std::string& value, Lang& out) {
     return false;
 }
 
-Lang detectLanguage() {
-    if (const char* explicitLang = std::getenv("TEXPLORER_LANG")) {
-        Lang lang;
-        if (parseLanguage(explicitLang, lang)) return lang;
-    }
+bool detectLanguageOverride(Lang& out) {
+    const char* explicitLang = std::getenv("TEXPLORER_LANG");
+    return explicitLang && parseLanguage(explicitLang, out);
+}
+
+Lang detectLanguage(Lang fallback) {
+    Lang lang;
+    if (detectLanguageOverride(lang)) return lang;
     for (const char* name : {"LC_ALL", "LC_MESSAGES", "LANG"}) {
         const char* value = std::getenv(name);
         if (!value || !*value) continue;
         Lang lang;
         if (parseLanguage(value, lang)) return lang;
     }
-    return Lang::SimplifiedChinese;
+    return fallback;
 }
 
 const char* text(Key key) {

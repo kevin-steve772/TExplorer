@@ -89,8 +89,8 @@ where.exe ninja
 - 操作：`navigate()`、`openCurrent()`、`copySel()`、`paste()`、`deleteSelection()`、
   `moveToTrash()`、`restoreSelection()` 等。
 - 对话框：`showDialog()`、`inputDialog()`、`popupMenu()`，各自是独立窗口和事件循环。
-- 多语言：`chooseLanguage()` 切换语言，`rebuildQuickItems()` 重建侧边栏；
-  文本统一通过 `i18n::tr()` / `i18n::tf()` 获取。
+- 多语言：`chooseLanguage()` 切换语言并写入 `config.json`，`rebuildQuickItems()`
+  重建侧边栏；文本统一通过 `i18n::tr()` / `i18n::tf()` 获取。
 
 ### 平台抽象
 
@@ -102,6 +102,7 @@ where.exe ninja
 - `plat::pathToUtf8()` / `plat::pathFromUtf8()` / `plat::joinPath()`
 - `plat::statFile()` / `plat::isExecutable()` / `plat::isHidden()`
 - `plat::homeDir()` / `plat::trashBaseDir()`
+- `plat::executableDir()`
 - `plat::openExternal()`
 - `plat::charWidth()`、`plat::enableMouseMotion()` / `disableMouseMotion()`
 
@@ -123,8 +124,11 @@ where.exe ninja
   English / 简体中文 / 繁體中文 / 梗体中文四列维护。
 - 新增文本时同时补齐四个语言；格式串使用 `%s`、`%zu`、`%%`，并保持参数顺序一致。
 - 英文单复数使用 `i18n::itemWord(n)`；中文可复用同一词。
-- `i18n::detectLanguage()` 依次检查 `TEXPLORER_LANG`、`LC_ALL`、`LC_MESSAGES`、
-  `LANG`，无法识别时回退到简体中文。
+- 语言优先级：`--lang` > `TEXPLORER_LANG` > 可执行文件同目录的 `config.json` >
+  `LC_ALL` / `LC_MESSAGES` / `LANG` > 简体中文。
+- `config.json` 目前只保存 `{"language":"en|zh|zh_TW|meme"}`；首次运行自动创建，
+  动作菜单切换语言后写回。读写失败不应阻止启动，保存失败时给用户提示。
+- `plat::executableDir()` 用于定位可执行文件目录，不要把配置路径硬编码到源码。
 - 启动参数 `--lang en|zh|zh_TW|meme`；运行中通过动作菜单的“语言”项切换。
 - 切换语言后调用 `rebuildQuickItems()` 和 `refresh()`，使侧边栏、表头、状态栏等立即更新。
 - `plat::userLocations()` / `rootLocations()` 的标签也使用 `i18n`，不要在平台层硬编码。
@@ -236,6 +240,7 @@ cmake --build build
    - 窄终端和窗口 resize
    - 中文、emoji、宽字符截断
    - 四种界面语言、`--lang`、`TEXPLORER_LANG` 和动作菜单语言切换
+   - `config.json` 的读取、首次创建、切换语言写回和不可写时的失败提示
    - 窄终端下的语言选择对话框
    - 回收站操作
    - Linux 下 `nano` 打开/退出后的 TUI 恢复
@@ -283,7 +288,7 @@ set -g mouse on
 `uninstall.ps1`：
 
 - 删除程序和用户 `PATH` 中的安装目录。
-- 默认保留回收站数据；`-PurgeData` 删除 `%LOCALAPPDATA%\TExplorer\Trash`。
+- 默认保留回收站数据和 `config.json`；`-PurgeData` 删除两者。
 - 支持 `-InstallDir`。
 
 修改安装目录、链接名、Release 资源命名或卸载行为时，必须同时更新对应平台的
