@@ -60,10 +60,10 @@ const Entry kEntries[] = {
         "牌有问题！: %s\n",
     }},
 
-    {Key::Ok, {"OK", "确定", "確定", "好喔"}},
+    {Key::Ok, {"OK", "确定", "確定", "彳亍"}},
     {Key::Cancel, {"Cancel", "取消", "取消", "算了"}},
-    {Key::Yes, {"Yes", "是", "是", "冲了"}},
-    {Key::No, {"No", "否", "否", "不要"}},
+    {Key::Yes, {"Yes", "是", "是", "来吧，走起！"}},
+    {Key::No, {"No", "否", "否", "别！别！"}},
     {Key::Unknown, {"Unknown", "未知", "未知", "谁知道呢"}},
 
     {Key::Home, {"Home", "主页", "主目錄", "家目录（回家，回家...）"}},
@@ -163,8 +163,8 @@ const Entry kEntries[] = {
     {Key::ConfigSaveFailed, {"Language changed, but config could not be saved.",
                              "语言已切换，但配置保存失败。",
                              "語言已切換，但設定儲存失敗。",
-                             "语言切好了，但 config.json 没写进去（权限在挡你）。"}},
-    {Key::TaskCenter, {"Task Center", "任务中心", "任務中心", "后台任务中心"}},
+                             "语言切好了，但 config.json 没写进去（用sudo试试？）。"}},
+    {Key::TaskCenter, {"Task Center", "任务中心", "任務中心", "任务中心"}},
     {Key::TasksEmpty, {"No background tasks", "没有后台任务", "沒有背景工作", "后台空空如也，像没装依赖"}},
     {Key::TaskRunning, {"Running", "进行中", "進行中", "正在跑"}},
     {Key::TaskDone, {"Done", "完成", "完成", "搞定了"}},
@@ -187,7 +187,7 @@ const Entry kEntries[] = {
                              "后台任务失败：%s",
                              "背景工作失敗：%s",
                              "后台任务翻车了：%s"}},
-    {Key::Close, {"Close", "关闭", "關閉", "关了"}},
+    {Key::Close, {"Close", "关闭", "關閉", "彳亍"}},
     {Key::NoRestore, {"Nothing to restore", "没有可还原的项目", "沒有可還原的項目", "空空如也的回收站"}},
 
     {Key::MoveToTrashTitle, {"Move to Trash", "移入回收站", "移入資源回收筒", "丢进黑洞"}},
